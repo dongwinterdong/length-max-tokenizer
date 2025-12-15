@@ -1,0 +1,8 @@
+rust_trainer/target/
+rust_trainer/.cargo/
+**/__pycache__/
+*.pyc
+token_table*.json
+hf_tokenizer_*/
+
+

@@ -1,0 +1,38 @@
+# --- Rust ---
+/target/
+**/target/
+
+# --- Python / wheels ---
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dylib
+*.dll
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# maturin / packaging outputs
+/dist/
+**/*.egg-info/
+
+# --- Large data / generated artifacts (do not commit) ---
+*.log
+/length_tokenizer.log
+
+# corpora
+/corpus_*.txt
+!/corpus_small.txt
+!/corpus_smoke.txt
+
+# derived inspection outputs
+/corpus_inspect_out/
+/corpus_py_initial_chars*.tsv
+
+# token tables (can be regenerated; some are multi-GB)
+/token_table*.json
+/token_table_safe*.json
+

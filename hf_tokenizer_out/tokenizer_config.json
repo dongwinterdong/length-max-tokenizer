@@ -1,0 +1,15 @@
+{
+  "auto_map": {
+    "AutoTokenizer": [
+      "tokenization_length_tokenizer.LengthTokenizer",
+      null
+    ]
+  },
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "mask_token": "<mask>",
+  "model_max_length": 1000000000,
+  "pad_token": "<pad>",
+  "tokenizer_class": "LengthTokenizer",
+  "unk_token": "<unk>"
+}

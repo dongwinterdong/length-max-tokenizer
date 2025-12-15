@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "length-tokenizer-rs"
+version = "0.1.0"
+description = "LengthTokenizer Rust (DP 最少 token / 最低 TPC) Python extension"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[tool.maturin]
+# Python import 名称：from length_tokenizer_rs import ...
+module-name = "length_tokenizer_rs"
+# 禁用默认 features（默认会启用 parquet/arrow，wheel 不需要，也可能导致体积/编译时间暴涨）
+no-default-features = true
+# 启用 Cargo feature，编译 PyO3 扩展
+features = ["python"]
+
+

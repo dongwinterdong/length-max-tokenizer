@@ -1,0 +1,41 @@
+[package]
+name = "length_tokenizer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# 生成 Python 扩展需要 cdylib；同时保留 rlib 供本项目的二进制/测试使用
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# 默认开启 parquet：让 CLI 直接支持 FineWeb(-Edu) 的 parquet 格式语料。
+# 注意：构建 Python wheel 时会在 pyproject.toml 里禁用 default features（只启用 python），避免把 arrow/parquet 打进 wheel。
+default = ["parquet"]
+# 仅在构建 Python wheel 时启用（maturin 会带上这个 feature）
+python = ["pyo3"]
+parquet = ["dep:parquet", "dep:arrow"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hashbrown = { version = "0.14", features = ["serde", "rayon"] }
+ rayon = "1.8"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ ahash = "0.8"
+ num_cpus = "1.16"
+ bincode = "1.3"
+ crossbeam-channel = "0.5"
+smallvec = { version = "1.13", features = ["serde"] }
+tikv-jemallocator = "0.5"
+humantime = "2.1"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+# Parquet 语料读取（FineWeb / FineWeb-Edu）
+arrow = { version = "54", optional = true }
+parquet = { version = "54", features = ["arrow"], optional = true }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
