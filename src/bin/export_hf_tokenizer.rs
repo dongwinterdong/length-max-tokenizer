@@ -1,23 +1,14 @@
 use anyhow::Result;
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashSet;
 use serde::de::{self, DeserializeSeed, MapAccess, Visitor};
 use serde::Deserialize;
-use serde_json::json;
-use std::cmp::Ordering;
 use std::fmt;
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 const END_TOKEN: &str = "Ġ";
-
-// HF 常用 special tokens（你也可以按自己模型偏好改）
-const UNK: &str = "<unk>";
-const PAD: &str = "<pad>";
-const BOS: &str = "<s>";
-const EOS: &str = "</s>";
-const MASK: &str = "<mask>";
 
 #[derive(Debug, Clone, Deserialize)]
 struct MergeRuleLite {
@@ -147,15 +138,6 @@ impl<'de, 'a> Visitor<'de> for RootVisitor<'a> {
     }
 }
 
-fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
-    let f = File::create(path)?;
-    let mut w = BufWriter::new(f);
-    serde_json::to_writer_pretty(&mut w, value)?;
-    w.write_all(b"\n")?;
-    w.flush()?;
-    Ok(())
-}
-
 fn main() -> Result<()> {
     // 用法：
     // cargo run --release --bin export_hf_tokenizer -- <token_table.json> <out_dir>
@@ -188,92 +170,10 @@ fn main() -> Result<()> {
         token_set.insert(c);
     }
 
-    // 追加 HF 常用 special tokens
-    for s in [UNK, PAD, BOS, EOS, MASK] {
-        token_set.insert(s.to_string());
-    }
-
-    // 确定性排序并分配 id：special tokens 固定在前面，其余按字典序
-    let mut tokens: Vec<String> = token_set.into_iter().collect();
-    tokens.sort_by(|a, b| a.cmp(b));
-
-    // 把 special tokens 放到最前（保持顺序）
-    fn is_special(s: &str) -> bool {
-        matches!(s, UNK | PAD | BOS | EOS | MASK)
-    }
-    tokens.sort_by(|a, b| match (is_special(a), is_special(b)) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        (true, true) => {
-            // 固定顺序
-            let rank = |x: &str| match x {
-                UNK => 0,
-                PAD => 1,
-                BOS => 2,
-                EOS => 3,
-                MASK => 4,
-                _ => 100,
-            };
-            rank(a).cmp(&rank(b))
-        }
-        (false, false) => a.cmp(b),
-    });
-
-    let mut vocab: HashMap<String, u32> = HashMap::new();
-    for (i, t) in tokens.iter().enumerate() {
-        vocab.insert(t.clone(), i as u32);
-    }
+    // 统一复用库内导出逻辑（会写出 vocab/config/special_tokens/remote-code/README）
+    let vocab = length_tokenizer::hf_export::build_vocab(token_set.into_iter().collect::<Vec<_>>());
     eprintln!("[export] vocab_size={}", vocab.len());
-
-    // 写 vocab.json（Transformers slow tokenizer 常用格式）
-    write_json(&out_dir.join("vocab.json"), &serde_json::to_value(&vocab)?)?;
-
-    // 写 tokenizer_config.json（remote code）
-    // 说明：用户加载时需要 trust_remote_code=True
-    let tokenizer_config = json!({
-        "tokenizer_class": "LengthTokenizer",
-        "auto_map": {
-            "AutoTokenizer": ["tokenization_length_tokenizer.LengthTokenizer", null]
-        },
-        "model_max_length": 1000000000,
-        "unk_token": UNK,
-        "pad_token": PAD,
-        "bos_token": BOS,
-        "eos_token": EOS,
-        "mask_token": MASK
-    });
-    write_json(&out_dir.join("tokenizer_config.json"), &tokenizer_config)?;
-
-    // 写 special_tokens_map.json
-    let special_tokens_map = json!({
-        "unk_token": UNK,
-        "pad_token": PAD,
-        "bos_token": BOS,
-        "eos_token": EOS,
-        "mask_token": MASK
-    });
-    write_json(&out_dir.join("special_tokens_map.json"), &special_tokens_map)?;
-
-    // 写 README.md（简短说明）
-    let readme = r#"
-### LengthTokenizer（DP 最小 token / 最低 TPC）
-
-这是一个用于 Hugging Face Transformers 的 **自定义 tokenizer**（remote code），分词策略为：
-- 先按空白切词，并把每个词变换为：`词 + "Ġ"`（与本仓库 Rust 训练口径一致）
-- 在给定 vocab 下，用 Trie + DP 找到 **token 数最少** 的全局最优切分（TPC 最低）
-
-#### 使用方法（Transformers）
-
-```python
-from transformers import AutoTokenizer
-
-tok = AutoTokenizer.from_pretrained("YOUR_USER/YOUR_REPO", trust_remote_code=True)
-print(tok.tokenize("hello world"))
-```
-
-> 注意：这是 remote code，需要 `trust_remote_code=True`。
-"#;
-    fs::write(out_dir.join("README.md"), readme.trim_start())?;
+    length_tokenizer::hf_export::write_hf_tokenizer_dir(&out_dir, &vocab)?;
 
     eprintln!("[export] done: {:?}", out_dir);
     Ok(())

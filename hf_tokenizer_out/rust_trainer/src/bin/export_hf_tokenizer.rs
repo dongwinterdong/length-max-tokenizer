@@ -36,7 +36,7 @@ fn load_merges_and_vocab_tokens(path: &Path, token_set: &mut HashSet<String>) ->
         token_set,
     };
     seed.deserialize(&mut de).map_err(|e| anyhow::anyhow!(e))?;
-    Ok(merges)
+                Ok(merges)
 }
 
 struct RootSeed<'a> {

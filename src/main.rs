@@ -297,8 +297,8 @@ fn main() -> Result<()> {
     if args.no_save {
         log_main("main", "no_save=true, skip writing token table");
     } else {
-        tokenizer.save(&args.output)?;
-        log_main("main", format!("saved token table to {:?}", args.output));
+    tokenizer.save(&args.output)?;
+    log_main("main", format!("saved token table to {:?}", args.output));
     }
 
     // 简单示例：对第一行做分词

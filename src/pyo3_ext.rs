@@ -16,13 +16,18 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use std::env;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 
-use crate::{LengthTokenizer, TokenTrie};
+use ahash::RandomState;
+use hashbrown::HashMap;
+use crate::{hf_export, LengthTokenizer, TokenTrie, TokenizerConfig};
 
 const END_TOKEN: &str = "Ġ";
 const UNK: &str = "<unk>";
@@ -31,6 +36,371 @@ const UNK: &str = "<unk>";
 struct DpTokenizer {
     trie: TokenTrie,
     unk_id: u32,
+}
+
+fn build_counts_chunk(
+    pool: &rayon::ThreadPool,
+    texts: &[String],
+) -> HashMap<Vec<String>, u32, RandomState> {
+    pool.install(|| {
+        texts
+            .par_iter()
+            .map(|s| {
+                let mut local: HashMap<Vec<String>, u32, RandomState> = HashMap::with_hasher(RandomState::new());
+                let encoded = LengthTokenizer::encode_sentence_str(s);
+                *local.entry(encoded).or_insert(0) += 1;
+                local
+            })
+            .reduce(
+                || HashMap::with_hasher(RandomState::new()),
+                |mut acc, m| {
+                    for (k, v) in m {
+                        *acc.entry(k).or_insert(0) += v;
+                    }
+                    acc
+                },
+            )
+    })
+}
+
+fn merge_counts_into(
+    dst: &mut HashMap<Vec<String>, u32, RandomState>,
+    src: HashMap<Vec<String>, u32, RandomState>,
+) {
+    for (k, v) in src {
+        let e = dst.entry(k).or_insert(0);
+        *e = e.saturating_add(v);
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    corpus_file,
+    out_dir,
+    num_merges=50000,
+    aim_token_num=20000,
+    n_max=6,
+    num_workers=0,
+    multi_process=false
+))]
+fn train_to_hf(
+    corpus_file: &str,
+    out_dir: &str,
+    num_merges: usize,
+    aim_token_num: usize,
+    n_max: usize,
+    num_workers: usize,
+    multi_process: bool,
+) -> PyResult<()> {
+    if n_max < 2 {
+        return Err(PyValueError::new_err("n_max must be >= 2"));
+    }
+
+    // multi-process 在 Python 进程内需要额外的 worker 启动方式；通过 MP_PY_WORKER 切换。
+    let prev_mp = env::var("MP_PY_WORKER").ok();
+    if multi_process {
+        env::set_var("MP_PY_WORKER", "1");
+    } else {
+        env::remove_var("MP_PY_WORKER");
+    }
+
+    let res = (|| -> anyhow::Result<()> {
+        let corpus = LengthTokenizer::load_corpus(corpus_file)?;
+        if corpus.is_empty() {
+            anyhow::bail!("corpus is empty: {corpus_file}");
+        }
+        let n_values: Vec<usize> = (2..=n_max).collect();
+        let cfg = TokenizerConfig {
+            num_merges,
+            n_values,
+            aim_token_num,
+            recompute_each_step: false,
+            num_workers,
+            use_multiprocess: multi_process,
+        };
+        let tk = LengthTokenizer::new(&corpus, cfg)?;
+        hf_export::export_from_trained(&tk, Path::new(out_dir))?;
+        Ok(())
+    })();
+
+    // 恢复环境变量，避免影响用户后续逻辑
+    match prev_mp {
+        Some(v) => env::set_var("MP_PY_WORKER", v),
+        None => env::remove_var("MP_PY_WORKER"),
+    }
+
+    res.map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    texts,
+    out_dir,
+    num_merges=50000,
+    aim_token_num=20000,
+    n_max=6,
+    num_workers=0,
+    multi_process=false,
+    max_docs=0,
+    chunk_size=4096
+))]
+fn train_to_hf_iter(
+    py: Python<'_>,
+    texts: &Bound<'_, PyAny>,
+    out_dir: &str,
+    num_merges: usize,
+    aim_token_num: usize,
+    n_max: usize,
+    num_workers: usize,
+    multi_process: bool,
+    max_docs: usize,
+    chunk_size: usize,
+) -> PyResult<()> {
+    if n_max < 2 {
+        return Err(PyValueError::new_err("n_max must be >= 2"));
+    }
+    if chunk_size == 0 {
+        return Err(PyValueError::new_err("chunk_size must be >= 1"));
+    }
+
+    let workers = if num_workers == 0 { num_cpus::get().max(1) } else { num_workers.max(1) };
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .map_err(|e| PyValueError::new_err(format!("build rayon pool failed: {e}")))?;
+
+    // multi-process 在 Python 进程内需要额外的 worker 启动方式；通过 MP_PY_WORKER 切换。
+    let prev_mp = env::var("MP_PY_WORKER").ok();
+    if multi_process {
+        env::set_var("MP_PY_WORKER", "1");
+    } else {
+        env::remove_var("MP_PY_WORKER");
+    }
+
+    let mut counts: HashMap<Vec<String>, u32, RandomState> = HashMap::with_hasher(RandomState::new());
+    let mut corpus_chars: u64 = 0;
+    let mut seen: usize = 0;
+    let mut buf: Vec<String> = Vec::with_capacity(chunk_size.min(1 << 20));
+
+    let res = (|| -> anyhow::Result<()> {
+        for item in texts.iter()? {
+            let s: String = item?.extract()?;
+            if s.trim().is_empty() {
+                continue;
+            }
+            corpus_chars = corpus_chars.saturating_add(s.chars().count() as u64);
+            buf.push(s);
+            seen += 1;
+            if max_docs > 0 && seen >= max_docs {
+                break;
+            }
+            if buf.len() >= chunk_size {
+                let chunk = std::mem::take(&mut buf);
+                let local = py.allow_threads(|| build_counts_chunk(&pool, &chunk));
+                merge_counts_into(&mut counts, local);
+            }
+        }
+
+        if !buf.is_empty() {
+            let chunk = std::mem::take(&mut buf);
+            let local = py.allow_threads(|| build_counts_chunk(&pool, &chunk));
+            merge_counts_into(&mut counts, local);
+        }
+
+        if counts.is_empty() {
+            anyhow::bail!("no training texts (empty iterator?)");
+        }
+
+        let n_values: Vec<usize> = (2..=n_max).collect();
+        let cfg = TokenizerConfig {
+            num_merges,
+            n_values,
+            aim_token_num,
+            recompute_each_step: false,
+            num_workers,
+            use_multiprocess: multi_process,
+        };
+
+        let tk = LengthTokenizer::new_from_counts(counts, corpus_chars, cfg)?;
+        hf_export::export_from_trained(&tk, Path::new(out_dir))?;
+        Ok(())
+    })();
+
+    // 恢复环境变量，避免影响用户后续逻辑
+    match prev_mp {
+        Some(v) => env::set_var("MP_PY_WORKER", v),
+        None => env::remove_var("MP_PY_WORKER"),
+    }
+
+    res.map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    Ok(())
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    parquet_path,
+    out_dir,
+    text_column="text",
+    max_docs=0,
+    batch_size=8192,
+    recursive=true,
+    num_merges=50000,
+    aim_token_num=20000,
+    n_max=6,
+    num_workers=0,
+    multi_process=false,
+    chunk_size=4096
+))]
+fn train_to_hf_parquet(
+    py: Python<'_>,
+    parquet_path: &str,
+    out_dir: &str,
+    text_column: &str,
+    max_docs: usize,
+    batch_size: usize,
+    recursive: bool,
+    num_merges: usize,
+    aim_token_num: usize,
+    n_max: usize,
+    num_workers: usize,
+    multi_process: bool,
+    chunk_size: usize,
+) -> PyResult<()> {
+    // 依赖 Python 侧 pyarrow 来读取 parquet（不把 arrow/parquet 打进 wheel）
+    let ds = py
+        .import_bound("pyarrow.dataset")
+        .map_err(|_| PyValueError::new_err("pyarrow is required for parquet: pip install pyarrow"))?;
+
+    let kwargs = PyDict::new_bound(py);
+    kwargs.set_item("format", "parquet")?;
+
+    // recursive=false 时只取目录下一层 parquet 文件（避免深层扫描）
+    let src_obj = if !recursive && Path::new(parquet_path).is_dir() {
+        let mut files: Vec<String> = Vec::new();
+        for ent in std::fs::read_dir(parquet_path)
+            .map_err(|e| PyValueError::new_err(format!("read_dir failed: {e}")))? {
+            let ent = ent.map_err(|e| PyValueError::new_err(format!("read_dir entry failed: {e}")))?;
+            let p = ent.path();
+            if p.is_file()
+                && p.extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("parquet"))
+                    .unwrap_or(false)
+            {
+                files.push(p.to_string_lossy().to_string());
+            }
+        }
+        if files.is_empty() {
+            return Err(PyValueError::new_err("no .parquet files found (recursive=false)"));
+        }
+        files.into_py(py)
+    } else {
+        parquet_path.into_py(py)
+    };
+
+    let dataset = ds.getattr("dataset")?.call((src_obj,), Some(&kwargs))?;
+
+    let scan_kwargs = PyDict::new_bound(py);
+    scan_kwargs.set_item("columns", vec![text_column])?;
+    scan_kwargs.set_item("batch_size", batch_size.max(1))?;
+    scan_kwargs.set_item("use_threads", true)?;
+    let scanner = dataset.call_method("scanner", (), Some(&scan_kwargs))?;
+    let batches = scanner.call_method0("to_batches")?;
+
+    // 把 parquet batch 展开成 string iterator，再走 train_to_hf_iter 的流式路径
+    // 这里为了减少 Python/Rust 往返，把每个 batch 的列一次性 to_pylist() 再抽取为 Vec<Option<String>>。
+    let mut buf: Vec<String> = Vec::with_capacity(chunk_size.max(1));
+    let mut seen: usize = 0;
+
+    // 先准备训练参数配置（复用 train_to_hf_iter 的实现思路，但 parquet 这边我们直接喂 Rust Strings）
+    if n_max < 2 {
+        return Err(PyValueError::new_err("n_max must be >= 2"));
+    }
+    if chunk_size == 0 {
+        return Err(PyValueError::new_err("chunk_size must be >= 1"));
+    }
+
+    let workers = if num_workers == 0 { num_cpus::get().max(1) } else { num_workers.max(1) };
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .build()
+        .map_err(|e| PyValueError::new_err(format!("build rayon pool failed: {e}")))?;
+
+    let prev_mp = env::var("MP_PY_WORKER").ok();
+    if multi_process {
+        env::set_var("MP_PY_WORKER", "1");
+    } else {
+        env::remove_var("MP_PY_WORKER");
+    }
+
+    let mut counts: HashMap<Vec<String>, u32, RandomState> = HashMap::with_hasher(RandomState::new());
+    let mut corpus_chars: u64 = 0;
+
+    let res = (|| -> anyhow::Result<()> {
+        for b in batches.iter()? {
+            let b = b?;
+            let col = b.call_method1("column", (0,))?;
+            let pylist = col.call_method0("to_pylist")?;
+            let rows: Vec<Option<String>> = pylist.extract()?;
+            for s in rows.into_iter().flatten() {
+                if s.trim().is_empty() {
+                    continue;
+                }
+                corpus_chars = corpus_chars.saturating_add(s.chars().count() as u64);
+                buf.push(s);
+                seen += 1;
+                if max_docs > 0 && seen >= max_docs {
+                    break;
+                }
+                if buf.len() >= chunk_size {
+                    let chunk = std::mem::take(&mut buf);
+                    let local = py.allow_threads(|| build_counts_chunk(&pool, &chunk));
+                    merge_counts_into(&mut counts, local);
+                }
+            }
+            if max_docs > 0 && seen >= max_docs {
+                break;
+            }
+        }
+
+        if !buf.is_empty() {
+            let chunk = std::mem::take(&mut buf);
+            let local = py.allow_threads(|| build_counts_chunk(&pool, &chunk));
+            merge_counts_into(&mut counts, local);
+        }
+        if counts.is_empty() {
+            anyhow::bail!("no training texts read from parquet");
+        }
+
+        let n_values: Vec<usize> = (2..=n_max).collect();
+        let cfg = TokenizerConfig {
+            num_merges,
+            n_values,
+            aim_token_num,
+            recompute_each_step: false,
+            num_workers,
+            use_multiprocess: multi_process,
+        };
+        let tk = LengthTokenizer::new_from_counts(counts, corpus_chars, cfg)?;
+        hf_export::export_from_trained(&tk, Path::new(out_dir))?;
+        Ok(())
+    })();
+
+    match prev_mp {
+        Some(v) => env::set_var("MP_PY_WORKER", v),
+        None => env::remove_var("MP_PY_WORKER"),
+    }
+
+    res.map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    Ok(())
+}
+
+/// worker 入口：供 multi-process 训练时子进程调用（不要在普通代码里直接用）
+#[pyfunction]
+fn _run_worker() -> PyResult<()> {
+    crate::run_worker().map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+    Ok(())
 }
 
 #[pymethods]
@@ -89,6 +459,10 @@ fn length_tokenizer_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("END_TOKEN", END_TOKEN)?;
     m.add_class::<DpTokenizer>()?;
+    m.add_function(wrap_pyfunction!(train_to_hf, m)?)?;
+    m.add_function(wrap_pyfunction!(train_to_hf_iter, m)?)?;
+    m.add_function(wrap_pyfunction!(train_to_hf_parquet, m)?)?;
+    m.add_function(wrap_pyfunction!(_run_worker, m)?)?;
     Ok(())
 }
 

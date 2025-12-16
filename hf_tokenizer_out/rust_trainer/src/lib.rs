@@ -1623,77 +1623,77 @@ impl LengthTokenizer {
 
                 // 如果本轮确实没有替换发生，直接跳过 diff 读取（避免无意义的大量 open 尝试）
                 if replacements_total > 0 {
-                    // 读取每个 worker 的 manifest（位图）：只打开真实存在的桶文件，避免 bucket_cnt*workers*2 次 open 尝试
-                    let mut manifests: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                    let mut manifest_ok = true;
-                    for wdir in &worker_dirs {
-                        if let Some(m) = read_diff_manifest(wdir, bucket_cnt) {
-                            manifests.push(m);
-                        } else {
-                            manifest_ok = false;
-                            break;
+                // 读取每个 worker 的 manifest（位图）：只打开真实存在的桶文件，避免 bucket_cnt*workers*2 次 open 尝试
+                let mut manifests: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                let mut manifest_ok = true;
+                for wdir in &worker_dirs {
+                    if let Some(m) = read_diff_manifest(wdir, bucket_cnt) {
+                        manifests.push(m);
+                    } else {
+                        manifest_ok = false;
+                        break;
+                    }
+                }
+
+                let buckets_to_read: Vec<usize> = if manifest_ok {
+                    let bits_len = diff_bits_len(bucket_cnt);
+                    let mut union_bits = vec![0u8; bits_len];
+                    for (old_bits, new_bits) in &manifests {
+                        for i in 0..bits_len {
+                            union_bits[i] |= old_bits[i] | new_bits[i];
                         }
                     }
+                    diff_bits_to_indices(&union_bits, bucket_cnt)
+                } else {
+                    (0..bucket_cnt).collect()
+                };
 
-                    let buckets_to_read: Vec<usize> = if manifest_ok {
-                        let bits_len = diff_bits_len(bucket_cnt);
-                        let mut union_bits = vec![0u8; bits_len];
-                        for (old_bits, new_bits) in &manifests {
-                            for i in 0..bits_len {
-                                union_bits[i] |= old_bits[i] | new_bits[i];
-                            }
-                        }
-                        diff_bits_to_indices(&union_bits, bucket_cnt)
-                    } else {
-                        (0..bucket_cnt).collect()
-                    };
-
-                    for b in buckets_to_read {
+                for b in buckets_to_read {
                         let mut bucket_old: HashMap<Ngram, Stat, RandomState> =
                             HashMap::with_hasher(RandomState::new());
                         let mut bucket_new: HashMap<Ngram, Stat, RandomState> =
                             HashMap::with_hasher(RandomState::new());
-                        for (wi, wdir) in worker_dirs.iter().enumerate() {
-                            // 有 manifest 时用位图过滤，否则 fallback 走 open 失败即跳过
-                            let (has_old, has_new) = if manifest_ok {
-                                let (ref old_bits, ref new_bits) = manifests[wi];
-                                (diff_bit_get(old_bits, b), diff_bit_get(new_bits, b))
-                            } else {
-                                (true, true)
-                            };
+                    for (wi, wdir) in worker_dirs.iter().enumerate() {
+                        // 有 manifest 时用位图过滤，否则 fallback 走 open 失败即跳过
+                        let (has_old, has_new) = if manifest_ok {
+                            let (ref old_bits, ref new_bits) = manifests[wi];
+                            (diff_bit_get(old_bits, b), diff_bit_get(new_bits, b))
+                        } else {
+                            (true, true)
+                        };
 
-                            if has_old {
-                                let p_old = wdir.join(format!("old_{b}.bin"));
+                        if has_old {
+                            let p_old = wdir.join(format!("old_{b}.bin"));
                                 if let Ok(_) = read_bucket_file_into(&p_old, &mut bucket_old) {
-                                    // 读完立刻删除，尤其在 TMPDIR=/dev/shm 时可显著降低内存峰值
-                                    let _ = fs::remove_file(&p_old);
-                                }
+                                // 读完立刻删除，尤其在 TMPDIR=/dev/shm 时可显著降低内存峰值
+                                let _ = fs::remove_file(&p_old);
                             }
-                            if has_new {
-                                let p_new = wdir.join(format!("new_{b}.bin"));
+                        }
+                        if has_new {
+                            let p_new = wdir.join(format!("new_{b}.bin"));
                                 if let Ok(_) = read_bucket_file_into(&p_new, &mut bucket_new) {
-                                    let _ = fs::remove_file(&p_new);
-                                }
+                                let _ = fs::remove_file(&p_new);
                             }
                         }
+                    }
 
-                        if !bucket_old.is_empty() {
-                            // 只保留 freq>1，减少 global_stats 体积；不会影响可合并候选集合
-                            if mp_use_heap {
-                                Self::accumulate_stats(&mut self.global_stats, &bucket_old, 1, false, true);
-                            } else {
-                                Self::accumulate_stats_owned(&mut self.global_stats, bucket_old, 1, false, true);
-                            }
+                    if !bucket_old.is_empty() {
+                        // 只保留 freq>1，减少 global_stats 体积；不会影响可合并候选集合
+                        if mp_use_heap {
+                            Self::accumulate_stats(&mut self.global_stats, &bucket_old, 1, false, true);
+                        } else {
+                            Self::accumulate_stats_owned(&mut self.global_stats, bucket_old, 1, false, true);
                         }
-                        if !bucket_new.is_empty() {
-                            if mp_use_heap {
-                                Self::accumulate_stats(&mut self.global_stats, &bucket_new, 1, true, true);
-                                for k in bucket_new.keys() {
-                                    // 对“增加项”必须 push：否则 score 变大但堆里仍是旧的低分，会选错 best（影响功能正确性）
-                                    self.push_candidate(k);
-                                }
-                            } else {
-                                Self::accumulate_stats_owned(&mut self.global_stats, bucket_new, 1, true, true);
+                    }
+                    if !bucket_new.is_empty() {
+                        if mp_use_heap {
+                            Self::accumulate_stats(&mut self.global_stats, &bucket_new, 1, true, true);
+                            for k in bucket_new.keys() {
+                                // 对“增加项”必须 push：否则 score 变大但堆里仍是旧的低分，会选错 best（影响功能正确性）
+                                self.push_candidate(k);
+                            }
+                        } else {
+                            Self::accumulate_stats_owned(&mut self.global_stats, bucket_new, 1, true, true);
                             }
                         }
                     }

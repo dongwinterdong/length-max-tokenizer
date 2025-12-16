@@ -182,10 +182,10 @@ class LengthTokenizer(PreTrainedTokenizer):
         if self._rust is not None:
             ids = self._rust.encode(text)
             return [self.id_to_token[int(i)] for i in ids]
-        else:
-            norm = _normalize(text)
-            ids = self._trie.dp_min_ids(norm, self._unk_id)
-            return [self.id_to_token[i] for i in ids]
+
+        norm = _normalize(text)
+        ids = self._trie.dp_min_ids(norm, self._unk_id)
+        return [self.id_to_token[i] for i in ids]
 
     def __call__(  # type: ignore[override]
         self,
