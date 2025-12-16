@@ -822,6 +822,53 @@ impl LengthTokenizer {
                 SeqEntry { tokens: ids, freq: f }
             })
             .collect();
+
+        // 重要：让基础 token（字符 + END_TOKEN）的 id 分配在不同进程/不同 HashMap 迭代顺序下仍保持确定性。
+        // 否则训练阶段在分数 tie-break（按 token id 序）时会产生不一致的 merges。
+        self.normalize_base_token_ids();
+    }
+
+    /// 将当前 interner 的 token id 重新映射为“按 token 字符串字典序”的确定性顺序，并同步重写 entries。
+    ///
+    /// 仅应在“尚未开始训练 merges”之前调用（此时只含基础 token）。
+    fn normalize_base_token_ids(&mut self) {
+        let n = self.interner.id_to_token.len();
+        if n == 0 {
+            return;
+        }
+
+        // (token, old_id) 按 token 排序，得到 old->new 映射
+        let mut pairs: Vec<(String, u32)> = self
+            .interner
+            .id_to_token
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut old_to_new: Vec<u32> = vec![0u32; n];
+        let mut new_id_to_token: Vec<String> = Vec::with_capacity(n);
+        for (new_id, (tok, old_id)) in pairs.into_iter().enumerate() {
+            old_to_new[old_id as usize] = new_id as u32;
+            new_id_to_token.push(tok);
+        }
+
+        // 重建 interner 映射
+        let mut new_token_to_id: HashMap<String, u32, RandomState> = HashMap::with_hasher(RandomState::new());
+        for (i, t) in new_id_to_token.iter().enumerate() {
+            new_token_to_id.insert(t.clone(), i as u32);
+        }
+        self.interner.id_to_token = new_id_to_token;
+        self.interner.token_to_id = new_token_to_id;
+
+        // 重写 entries
+        for e in &mut self.entries {
+            for id in &mut e.tokens {
+                let old = *id as usize;
+                *id = old_to_new[old];
+            }
+        }
     }
 
     /// 多进程预处理：将语料分片发送到子进程统计局部词频，再归并到主进程。
@@ -1565,96 +1612,97 @@ impl LengthTokenizer {
             let elapsed_stats = t0.elapsed().as_secs_f32();
             let t_apply = Instant::now();
 
-            // 增量模式：按 bucket 聚合（去重）后再更新 global_stats，并仅对唯一 key 推入候选堆，
-            // 避免“逐条 push_candidate”导致 heap 重复爆炸进而 OOM kill。
-            let mut any_change = false;
+            // 真实“是否发生变化”应该以本轮 merge 实际替换次数为准（而不是 diff 文件是否存在）。
+            // 否则在禁用/缺失 diff（例如 MP_NO_DIFF/MP_LOW_MEM 或其它异常）时会误判 no-op，
+            // 进而触发不必要的全量重算，严重拖慢训练。
+            let replacements_total: u64;
             if use_incremental {
-                let (temp_root, worker_dirs, bucket_cnt) =
+                let (temp_root, worker_dirs, bucket_cnt, repl) =
                     pool.apply_merge_prepare(&best_parts, replacement_id, self.cfg.recompute_each_step)?;
+                replacements_total = repl;
 
-                // 读取每个 worker 的 manifest（位图）：只打开真实存在的桶文件，避免 bucket_cnt*workers*2 次 open 尝试
-                let mut manifests: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                let mut manifest_ok = true;
-                for wdir in &worker_dirs {
-                    if let Some(m) = read_diff_manifest(wdir, bucket_cnt) {
-                        manifests.push(m);
+                // 如果本轮确实没有替换发生，直接跳过 diff 读取（避免无意义的大量 open 尝试）
+                if replacements_total > 0 {
+                    // 读取每个 worker 的 manifest（位图）：只打开真实存在的桶文件，避免 bucket_cnt*workers*2 次 open 尝试
+                    let mut manifests: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                    let mut manifest_ok = true;
+                    for wdir in &worker_dirs {
+                        if let Some(m) = read_diff_manifest(wdir, bucket_cnt) {
+                            manifests.push(m);
+                        } else {
+                            manifest_ok = false;
+                            break;
+                        }
+                    }
+
+                    let buckets_to_read: Vec<usize> = if manifest_ok {
+                        let bits_len = diff_bits_len(bucket_cnt);
+                        let mut union_bits = vec![0u8; bits_len];
+                        for (old_bits, new_bits) in &manifests {
+                            for i in 0..bits_len {
+                                union_bits[i] |= old_bits[i] | new_bits[i];
+                            }
+                        }
+                        diff_bits_to_indices(&union_bits, bucket_cnt)
                     } else {
-                        manifest_ok = false;
-                        break;
-                    }
-                }
+                        (0..bucket_cnt).collect()
+                    };
 
-                let buckets_to_read: Vec<usize> = if manifest_ok {
-                    let bits_len = diff_bits_len(bucket_cnt);
-                    let mut union_bits = vec![0u8; bits_len];
-                    for (old_bits, new_bits) in &manifests {
-                        for i in 0..bits_len {
-                            union_bits[i] |= old_bits[i] | new_bits[i];
-                        }
-                    }
-                    diff_bits_to_indices(&union_bits, bucket_cnt)
-                } else {
-                    (0..bucket_cnt).collect()
-                };
+                    for b in buckets_to_read {
+                        let mut bucket_old: HashMap<Ngram, Stat, RandomState> =
+                            HashMap::with_hasher(RandomState::new());
+                        let mut bucket_new: HashMap<Ngram, Stat, RandomState> =
+                            HashMap::with_hasher(RandomState::new());
+                        for (wi, wdir) in worker_dirs.iter().enumerate() {
+                            // 有 manifest 时用位图过滤，否则 fallback 走 open 失败即跳过
+                            let (has_old, has_new) = if manifest_ok {
+                                let (ref old_bits, ref new_bits) = manifests[wi];
+                                (diff_bit_get(old_bits, b), diff_bit_get(new_bits, b))
+                            } else {
+                                (true, true)
+                            };
 
-                for b in buckets_to_read {
-                    let mut bucket_old: HashMap<Ngram, Stat, RandomState> = HashMap::with_hasher(RandomState::new());
-                    let mut bucket_new: HashMap<Ngram, Stat, RandomState> = HashMap::with_hasher(RandomState::new());
-                    for (wi, wdir) in worker_dirs.iter().enumerate() {
-                        // 有 manifest 时用位图过滤，否则 fallback 走 open 失败即跳过
-                        let (has_old, has_new) = if manifest_ok {
-                            let (ref old_bits, ref new_bits) = manifests[wi];
-                            (diff_bit_get(old_bits, b), diff_bit_get(new_bits, b))
-                        } else {
-                            (true, true)
-                        };
-
-                        if has_old {
-                            let p_old = wdir.join(format!("old_{b}.bin"));
-                            if let Ok(any) = read_bucket_file_into(&p_old, &mut bucket_old) {
-                                if any {
-                                    any_change = true;
+                            if has_old {
+                                let p_old = wdir.join(format!("old_{b}.bin"));
+                                if let Ok(_) = read_bucket_file_into(&p_old, &mut bucket_old) {
+                                    // 读完立刻删除，尤其在 TMPDIR=/dev/shm 时可显著降低内存峰值
+                                    let _ = fs::remove_file(&p_old);
                                 }
-                                // 读完立刻删除，尤其在 TMPDIR=/dev/shm 时可显著降低内存峰值
-                                let _ = fs::remove_file(&p_old);
                             }
-                        }
-                        if has_new {
-                            let p_new = wdir.join(format!("new_{b}.bin"));
-                            if let Ok(any) = read_bucket_file_into(&p_new, &mut bucket_new) {
-                                if any {
-                                    any_change = true;
+                            if has_new {
+                                let p_new = wdir.join(format!("new_{b}.bin"));
+                                if let Ok(_) = read_bucket_file_into(&p_new, &mut bucket_new) {
+                                    let _ = fs::remove_file(&p_new);
                                 }
-                                let _ = fs::remove_file(&p_new);
                             }
                         }
-                    }
 
-                    if !bucket_old.is_empty() {
-                        // 只保留 freq>1，减少 global_stats 体积；不会影响可合并候选集合
-                        if mp_use_heap {
-                            Self::accumulate_stats(&mut self.global_stats, &bucket_old, 1, false, true);
-                        } else {
-                            Self::accumulate_stats_owned(&mut self.global_stats, bucket_old, 1, false, true);
-                        }
-                    }
-                    if !bucket_new.is_empty() {
-                        if mp_use_heap {
-                            Self::accumulate_stats(&mut self.global_stats, &bucket_new, 1, true, true);
-                            for k in bucket_new.keys() {
-                                // 对“增加项”必须 push：否则 score 变大但堆里仍是旧的低分，会选错 best（影响功能正确性）
-                                self.push_candidate(k);
+                        if !bucket_old.is_empty() {
+                            // 只保留 freq>1，减少 global_stats 体积；不会影响可合并候选集合
+                            if mp_use_heap {
+                                Self::accumulate_stats(&mut self.global_stats, &bucket_old, 1, false, true);
+                            } else {
+                                Self::accumulate_stats_owned(&mut self.global_stats, bucket_old, 1, false, true);
                             }
-                        } else {
-                            Self::accumulate_stats_owned(&mut self.global_stats, bucket_new, 1, true, true);
+                        }
+                        if !bucket_new.is_empty() {
+                            if mp_use_heap {
+                                Self::accumulate_stats(&mut self.global_stats, &bucket_new, 1, true, true);
+                                for k in bucket_new.keys() {
+                                    // 对“增加项”必须 push：否则 score 变大但堆里仍是旧的低分，会选错 best（影响功能正确性）
+                                    self.push_candidate(k);
+                                }
+                            } else {
+                                Self::accumulate_stats_owned(&mut self.global_stats, bucket_new, 1, true, true);
+                            }
                         }
                     }
                 }
                 let _ = fs::remove_dir_all(&temp_root);
             } else {
-            let (old_diff, new_diff) =
+            let (old_diff, new_diff, repl) =
                 pool.apply_merge(&best_parts, replacement_id, self.cfg.recompute_each_step)?;
-                any_change = !(old_diff.is_empty() && new_diff.is_empty());
+                replacements_total = repl;
                 if use_incremental {
                     // 不会进入
                 }
@@ -1676,7 +1724,7 @@ impl LengthTokenizer {
 
             // 如果本次合并没有产生任何增量，视为无效 merge：尝试全量重算一次以防止重复选择；
             // 若仍无可合并则直接停止，避免出现重复的 merge 记录。
-            let no_change = !any_change;
+            let no_change = replacements_total == 0;
             if no_change {
                 log_warn(
                     "train_mp",
@@ -2343,6 +2391,8 @@ enum WorkerResponse {
     Stats { stats: HashMap<Ngram, Stat, RandomState> },
     ApplyResult {
         entry_count: usize,
+        /// 本次 merge 实际替换的次数（按 entry.freq 加权）
+        replacements: u64,
     },
     Entries { entries: Vec<SeqEntry> },
     Error(String),
@@ -2586,8 +2636,16 @@ impl ProcessPool {
         parts: &[u32],
         replacement_id: u32,
         recompute_each_step: bool,
-    ) -> Result<(PathBuf, Vec<PathBuf>, usize)> {
-        let low_mem = std::env::var("MP_NO_DIFF").is_ok() || std::env::var("MP_LOW_MEM").is_ok();
+    ) -> Result<(PathBuf, Vec<PathBuf>, usize, u64)> {
+        // 重要：与主进程 train_multiprocess 的决策保持一致。
+        // - 若设置 MP_FORCE_INCREMENTAL，则必须返回 diff（否则主进程无法做增量更新，会误判 no-op 并触发全量重算）。
+        // - 否则 MP_NO_DIFF/MP_LOW_MEM 才会关闭 diff（低内存路径）。
+        let force_inc = std::env::var("MP_FORCE_INCREMENTAL").is_ok();
+        let low_mem = if force_inc {
+            false
+        } else {
+            std::env::var("MP_NO_DIFF").is_ok() || std::env::var("MP_LOW_MEM").is_ok()
+        };
         let bucket_cnt = std::env::var("MP_BUCKETS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -2636,9 +2694,11 @@ impl ProcessPool {
             worker.send_only(&req)?;
         }
 
+        let mut replacements_total: u64 = 0;
         for (i, worker) in self.workers.iter_mut().enumerate() {
             match worker.recv(&format!("worker:{}:apply", i))? {
-                WorkerResponse::ApplyResult { .. } => {
+                WorkerResponse::ApplyResult { replacements, .. } => {
+                    replacements_total = replacements_total.saturating_add(replacements);
                     log_debug(
                         "proc_pool",
                         format!(
@@ -2655,7 +2715,7 @@ impl ProcessPool {
             }
         }
 
-        Ok((temp_root, worker_dirs, bucket_cnt))
+        Ok((temp_root, worker_dirs, bucket_cnt, replacements_total))
     }
 
     fn apply_merge(
@@ -2663,13 +2723,23 @@ impl ProcessPool {
         parts: &[u32],
         replacement_id: u32,
         recompute_each_step: bool,
-    ) -> Result<(HashMap<Ngram, Stat, RandomState>, HashMap<Ngram, Stat, RandomState>)> {
-        let low_mem = std::env::var("MP_NO_DIFF").is_ok() || std::env::var("MP_LOW_MEM").is_ok();
-        let (temp_root, worker_dirs, bucket_cnt) =
+    ) -> Result<(HashMap<Ngram, Stat, RandomState>, HashMap<Ngram, Stat, RandomState>, u64)> {
+        let (temp_root, worker_dirs, bucket_cnt, replacements_total) =
             self.apply_merge_prepare(parts, replacement_id, recompute_each_step)?;
+        // 同 apply_merge_prepare：MP_FORCE_INCREMENTAL 强制启用 diff
+        let force_inc = std::env::var("MP_FORCE_INCREMENTAL").is_ok();
+        let low_mem = if force_inc {
+            false
+        } else {
+            std::env::var("MP_NO_DIFF").is_ok() || std::env::var("MP_LOW_MEM").is_ok()
+        };
         if low_mem {
             let _ = fs::remove_dir_all(&temp_root);
-            return Ok((HashMap::with_hasher(RandomState::new()), HashMap::with_hasher(RandomState::new())));
+            return Ok((
+                HashMap::with_hasher(RandomState::new()),
+                HashMap::with_hasher(RandomState::new()),
+                replacements_total,
+            ));
         }
 
         // 读取 manifest（位图）：只打开存在的桶文件，避免 bucket_cnt*workers*2 次 open 尝试
@@ -2737,7 +2807,7 @@ impl ProcessPool {
 
         let _ = fs::remove_dir_all(&temp_root);
 
-        Ok((old_acc, new_acc))
+        Ok((old_acc, new_acc, replacements_total))
     }
 
     fn collect_entries(&mut self) -> Result<Vec<SeqEntry>> {
@@ -2922,7 +2992,7 @@ fn worker_apply_merge(
     return_diff: bool,
     bucket_cnt: usize,
     temp_dir: &Path,
-) -> usize {
+) -> (usize, u64) {
     #[derive(Default)]
     struct Buffers {
         positions: Vec<usize>,
@@ -3014,10 +3084,11 @@ fn worker_apply_merge(
     // 严重拖慢并放大内存（之前的 OOM/慢很多就是这个原因之一）。
     let bucket_hasher = RandomState::new();
 
-    let buckets: HashMap<Vec<u32>, u32, RandomState> = pool.install(|| {
+    let (buckets, replacements_total): (HashMap<Vec<u32>, u32, RandomState>, u64) = pool.install(|| {
         entries
             .par_chunks_mut(chunk)
             .map(|chunk_entries| {
+                let mut chunk_repl: u64 = 0;
                 let mut chunk_old: HashMap<Ngram, Stat, RandomState> =
                     HashMap::with_hasher(RandomState::new());
                 let mut chunk_new: HashMap<Ngram, Stat, RandomState> =
@@ -3058,6 +3129,9 @@ fn worker_apply_merge(
                             *chunk_buckets.entry(tokens).or_insert(0) += freq;
                             continue;
                         }
+                        // 记录实际替换次数（按 entry.freq 加权）
+                        chunk_repl = chunk_repl
+                            .saturating_add(bufs.positions.len() as u64 * freq as u64);
 
                         // 受影响窗口（旧）
                         let affected_old = collect_starts(len_old, &bufs.positions, n_vals, plen);
@@ -3161,6 +3235,8 @@ fn worker_apply_merge(
                                 tokens[write] = replacement_id;
                                 write += 1;
                                 read += plen;
+                                // 记录实际替换次数（按 entry.freq 加权）
+                                chunk_repl = chunk_repl.saturating_add(freq as u64);
                             } else {
                                 if write != read {
                                     tokens[write] = tokens[read];
@@ -3218,14 +3294,15 @@ fn worker_apply_merge(
                     }
                 }
 
-                chunk_buckets
+                (chunk_buckets, chunk_repl)
             })
             .reduce(
-                || HashMap::with_hasher(RandomState::new()),
-                |mut acc, m| {
+                || (HashMap::with_hasher(RandomState::new()), 0u64),
+                |mut acc, (m, r)| {
                     for (k, v) in m {
-                        *acc.entry(k).or_insert(0) += v;
+                        *acc.0.entry(k).or_insert(0) += v;
                     }
+                    acc.1 = acc.1.saturating_add(r);
                     acc
                 },
             )
@@ -3282,7 +3359,7 @@ fn worker_apply_merge(
         ),
     );
 
-    state.entries.len()
+    (state.entries.len(), replacements_total)
 }
 
 fn worker_loop() -> Result<()> {
@@ -3330,7 +3407,7 @@ fn worker_loop() -> Result<()> {
             WorkerRequest::ApplyMerge { parts, replacement_id, recompute_each_step: _, return_diff, bucket_cnt, temp_dir } => {
                 if let Some(st) = state.as_mut() {
                     let n_vals = st.n_values.clone();
-                    let entry_count = worker_apply_merge(
+                    let (entry_count, replacements) = worker_apply_merge(
                         st,
                         &parts,
                         replacement_id,
@@ -3343,6 +3420,7 @@ fn worker_loop() -> Result<()> {
                         &mut writer,
                         &WorkerResponse::ApplyResult {
                             entry_count,
+                            replacements,
                         },
                     )?;
                 } else {

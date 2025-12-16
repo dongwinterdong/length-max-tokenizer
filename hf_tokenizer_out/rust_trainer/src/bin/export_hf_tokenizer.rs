@@ -11,7 +11,6 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const END_TOKEN: &str = "Ġ";
-const STOP_PREFIX: &str = "__STOP_AFTER_MERGES__";
 
 // HF 常用 special tokens（你也可以按自己模型偏好改）
 const UNK: &str = "<unk>";
@@ -26,29 +25,23 @@ struct MergeRuleLite {
     replacement: String,
 }
 
-fn load_merges_only(path: &Path) -> Result<Vec<MergeRuleLite>> {
+fn load_merges_and_vocab_tokens(path: &Path, token_set: &mut HashSet<String>) -> Result<Vec<MergeRuleLite>> {
     let f = File::open(path)?;
     let reader = BufReader::with_capacity(16 * 1024 * 1024, f);
     let mut de = serde_json::Deserializer::from_reader(reader);
 
     let mut merges: Vec<MergeRuleLite> = Vec::new();
-    let seed = RootSeed { merges: &mut merges };
-
-    match seed.deserialize(&mut de) {
-        Ok(()) => Ok(merges),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.starts_with(STOP_PREFIX) {
-                Ok(merges)
-            } else {
-                Err(e.into())
-            }
-        }
-    }
+    let seed = RootSeed {
+        merges: &mut merges,
+        token_set,
+    };
+    seed.deserialize(&mut de).map_err(|e| anyhow::anyhow!(e))?;
+    Ok(merges)
 }
 
 struct RootSeed<'a> {
     merges: &'a mut Vec<MergeRuleLite>,
+    token_set: &'a mut HashSet<String>,
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for RootSeed<'a> {
@@ -58,12 +51,61 @@ impl<'de, 'a> DeserializeSeed<'de> for RootSeed<'a> {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_map(RootVisitor { merges: self.merges })
+        deserializer.deserialize_map(RootVisitor {
+            merges: self.merges,
+            token_set: self.token_set,
+        })
     }
 }
 
 struct RootVisitor<'a> {
     merges: &'a mut Vec<MergeRuleLite>,
+    token_set: &'a mut HashSet<String>,
+}
+
+struct VocabSeed<'a> {
+    token_set: &'a mut HashSet<String>,
+}
+
+impl<'de, 'a> DeserializeSeed<'de> for VocabSeed<'a> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(VocabVisitor {
+            token_set: self.token_set,
+        })
+    }
+}
+
+struct VocabVisitor<'a> {
+    token_set: &'a mut HashSet<String>,
+}
+
+impl<'de, 'a> Visitor<'de> for VocabVisitor<'a> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "token table vocab map")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        while let Some(key) = map.next_key::<String>()? {
+            // vocab key is a token sequence joined by whitespace (e.g. "helloĠ w o r l d Ġ")
+            for tok in key.split_whitespace() {
+                if !self.token_set.contains(tok) {
+                    self.token_set.insert(tok.to_string());
+                }
+            }
+            let _ = map.next_value::<de::IgnoredAny>()?;
+        }
+        Ok(())
+    }
 }
 
 impl<'de, 'a> Visitor<'de> for RootVisitor<'a> {
@@ -82,10 +124,19 @@ impl<'de, 'a> Visitor<'de> for RootVisitor<'a> {
                 "merges" => {
                     let v: Vec<MergeRuleLite> = map.next_value()?;
                     *self.merges = v;
+                    // collect tokens from merges (parts + replacement)
+                    for m in self.merges.iter() {
+                        for p in m.parts.iter() {
+                            self.token_set.insert(p.clone());
+                        }
+                        self.token_set.insert(m.replacement.clone());
+                    }
                 }
                 "vocab" => {
-                    // 不读取 2GB+ vocab，直接停止
-                    return Err(de::Error::custom(STOP_PREFIX));
+                    // Stream over vocab keys (ignore values) to ensure we keep base character tokens.
+                    map.next_value_seed(VocabSeed {
+                        token_set: self.token_set,
+                    })?;
                 }
                 _ => {
                     let _ = map.next_value::<de::IgnoredAny>()?;
@@ -120,19 +171,11 @@ fn main() -> Result<()> {
     let out_dir = PathBuf::from(&args[2]);
     fs::create_dir_all(&out_dir)?;
 
-    eprintln!("[export] 读取 merges（不读 vocab）: {:?}", table_path);
-    let merges = load_merges_only(&table_path)?;
-    eprintln!("[export] merges={}", merges.len());
-
-    // 构建 token 集合（parts + replacement）
+    eprintln!("[export] 读取 merges + vocab keys（流式，不加载大 vocab）: {:?}", table_path);
     let mut token_set: HashSet<String> = HashSet::new();
     token_set.insert(END_TOKEN.to_string());
-    for m in &merges {
-        for p in &m.parts {
-            token_set.insert(p.clone());
-        }
-        token_set.insert(m.replacement.clone());
-    }
+    let merges = load_merges_and_vocab_tokens(&table_path, &mut token_set)?;
+    eprintln!("[export] merges={}", merges.len());
 
     // 为了 DP 兜底，补齐“单字符 token”（至少覆盖 merges 中出现过的字符）
     let mut single_chars: HashSet<String> = HashSet::new();
