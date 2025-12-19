@@ -234,6 +234,36 @@ python validate_modern_arch_llama.py \
 
 建议用于 rebuttal 的正式实验：保持同语料/同 vocab size/同超参，只替换 tokenizer（BPE vs Length-MAX），并在该现代架构上报告 steps-to-target loss、latency/throughput、以及下游任务指标。
 
+##### 5.1 2×GPU（例如 2×5060Ti 16GB）推荐跑法：torchrun DDP
+
+脚本已支持 DDP。示例（两张卡）：
+
+```bash
+torchrun --standalone --nproc_per_node 2 validate_modern_arch_llama.py \
+  --tokenizer_dir ./tokenizer_out \
+  --corpus_file corpus.txt \
+  --max_lines 0 \
+  --device cuda \
+  --precision bf16 \
+  --grad_checkpointing \
+  --seq_len 1024 \
+  --batch_size 32 \
+  --grad_accum 4 \
+  --steps 2000 \
+  --lr 3e-4 \
+  --weight_decay 0.1 \
+  --print_every 50 \
+  --hidden_size 768 \
+  --num_layers 12 \
+  --num_heads 12 \
+  --num_kv_heads 12 \
+  --intermediate_size 2048
+```
+
+说明：
+- `--batch_size` 是 **global batch size**（DDP 下会按 world size 自动切分到每张卡）。
+- 显存不够时，优先开 `--grad_checkpointing`，然后减小 `--seq_len` 或 `--batch_size`，用 `--grad_accum` 把全局 batch 拉回去。
+
 #### 6) Publish to PyPI（推荐用 GitHub Actions）
 
 这个仓库原本就带了 GitHub Actions 发版流程：`tokenizers_rust/.github/workflows/publish_pypi.yml`。

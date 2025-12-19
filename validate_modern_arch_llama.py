@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 
@@ -38,6 +40,23 @@ def _read_lines(path: Path, max_lines: int) -> list[str]:
     return lines
 
 
+def _ddp_setup() -> tuple[bool, int, int, int]:
+    """
+    Returns: (is_ddp, rank, local_rank, world_size)
+    """
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        dist.init_process_group(backend="nccl")
+        return True, rank, local_rank, world_size
+    return False, 0, 0, 1
+
+
+def _is_main(rank: int) -> bool:
+    return rank == 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokenizer_dir", type=str, required=True, help="Length-MAX 导出的 HF tokenizer 目录（含 vocab.json 等）")
@@ -47,11 +66,14 @@ def main() -> None:
 
     # 训练设置（快速 sanity check）
     ap.add_argument("--seq_len", type=int, default=256)
-    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--batch_size", type=int, default=8, help="global batch size（DDP 下会按 world_size 自动切分）")
     ap.add_argument("--steps", type=int, default=100)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight_decay", type=float, default=0.1)
     ap.add_argument("--print_every", type=int, default=10)
+    ap.add_argument("--grad_accum", type=int, default=1)
+    ap.add_argument("--precision", type=str, default="fp32", choices=["fp32", "fp16", "bf16"])
+    ap.add_argument("--grad_checkpointing", action="store_true")
 
     # Llama-style 小模型结构（可按需要调到 ~100M 量级）
     ap.add_argument("--hidden_size", type=int, default=256)
@@ -65,6 +87,8 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     ap.add_argument("--disable_rust", action="store_true", help="禁用 Rust 扩展分词（用于对齐/排障）")
     args = ap.parse_args()
+
+    is_ddp, rank, local_rank, world_size = _ddp_setup()
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -102,27 +126,54 @@ def main() -> None:
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    if is_ddp:
+        assert device == "cuda", "DDP requires --device cuda (or auto with CUDA available)"
+        torch.cuda.set_device(local_rank)
+        model.to(torch.device("cuda", local_rank))
+    else:
+        model.to(device)
+
+    if args.grad_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
 
     num_params = sum(p.numel() for p in model.parameters())
-    print("== setup ==")
-    print(f"tokenizer_dir = {args.tokenizer_dir}")
-    print(f"corpus_file   = {args.corpus_file} (lines={len(lines)})")
-    print(f"vocab_size    = {tok.vocab_size}")
-    print(f"pad/bos/eos   = {tok.pad_token_id}/{tok.bos_token_id}/{tok.eos_token_id}")
-    print(f"model         = LlamaForCausalLM (params={num_params})")
-    print(f"device        = {device}")
-    print(f"seq_len       = {args.seq_len} batch_size={args.batch_size} steps={args.steps}")
-    print(f"rust_active   = {getattr(tok, '_rust', None) is not None}")
-    print()
+    if _is_main(rank):
+        print("== setup ==")
+        print(f"tokenizer_dir = {args.tokenizer_dir}")
+        print(f"corpus_file   = {args.corpus_file} (lines={len(lines)})")
+        print(f"vocab_size    = {tok.vocab_size}")
+        print(f"pad/bos/eos   = {tok.pad_token_id}/{tok.bos_token_id}/{tok.eos_token_id}")
+        print(f"model         = LlamaForCausalLM (params={num_params})")
+        print(f"device        = {device}")
+        print(f"ddp           = {is_ddp} world_size={world_size}")
+        print(f"seq_len       = {args.seq_len} batch_size={args.batch_size} steps={args.steps} grad_accum={args.grad_accum}")
+        print(f"precision     = {args.precision} grad_ckpt={args.grad_checkpointing}")
+        print(f"rust_active   = {getattr(tok, '_rust', None) is not None}")
+        print()
 
     # 4) training loop (few steps)
     model.train()
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    if args.precision == "fp16":
+        scaler = torch.cuda.amp.GradScaler()
+        autocast_dtype = torch.float16
+    elif args.precision == "bf16":
+        scaler = None
+        autocast_dtype = torch.bfloat16
+    else:
+        scaler = None
+        autocast_dtype = None
 
     t0 = time.perf_counter()
     for step in range(args.steps):
-        batch = [random.choice(lines) for _ in range(args.batch_size)]
+        # DDP：global batch 会按 world_size 切分到每个 rank
+        per_rank_bs = max(1, args.batch_size // world_size)
+        batch = [random.choice(lines) for _ in range(per_rank_bs)]
         enc = tok(
             batch,
             return_tensors="pt",
@@ -131,30 +182,57 @@ def main() -> None:
             max_length=args.seq_len,
             add_special_tokens=True,
         )
-        input_ids = enc["input_ids"].to(device)
-        attention_mask = enc["attention_mask"].to(device)
+        if is_ddp:
+            dev = torch.device("cuda", local_rank)
+        else:
+            dev = torch.device(device)
+        input_ids = enc["input_ids"].to(dev)
+        attention_mask = enc["attention_mask"].to(dev)
 
         labels = input_ids.clone()
         labels[labels == int(tok.pad_token_id)] = -100
 
-        out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        loss = out.loss
-        loss.backward()
-        opt.step()
-        opt.zero_grad(set_to_none=True)
+        if autocast_dtype is None:
+            out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            loss = out.loss / max(1, args.grad_accum)
+            loss.backward()
+        else:
+            with torch.cuda.amp.autocast(dtype=autocast_dtype):
+                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = out.loss / max(1, args.grad_accum)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
-        if step % args.print_every == 0 or step == args.steps - 1:
+        if (step + 1) % max(1, args.grad_accum) == 0:
+            if scaler is not None:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
+            opt.zero_grad(set_to_none=True)
+
+        if _is_main(rank) and (step % args.print_every == 0 or step == args.steps - 1):
             elapsed = time.perf_counter() - t0
             toks = (step + 1) * args.batch_size * args.seq_len
             print(f"step={step:04d} loss={loss.item():.4f} tok/s={toks/elapsed:.1f}")
 
     # 5) quick generate
-    model.eval()
+    if is_ddp:
+        model.module.eval()
+    else:
+        model.eval()
     prompt = "hello world"
     enc = tok(prompt, return_tensors="pt", add_special_tokens=True)
-    input_ids = enc["input_ids"].to(device)
+    if is_ddp:
+        dev = torch.device("cuda", local_rank)
+    else:
+        dev = torch.device(device)
+    input_ids = enc["input_ids"].to(dev)
     with torch.no_grad():
-        gen = model.generate(
+        gen_model = model.module if is_ddp else model
+        gen = gen_model.generate(
             input_ids=input_ids,
             max_new_tokens=32,
             do_sample=True,
@@ -164,10 +242,14 @@ def main() -> None:
             eos_token_id=int(tok.eos_token_id),
         )
     text = tok.decode(gen[0].tolist(), skip_special_tokens=True)
-    print()
-    print("== generate ==")
-    print(f"prompt = {prompt!r}")
-    print(f"out    = {text!r}")
+    if _is_main(rank):
+        print()
+        print("== generate ==")
+        print(f"prompt = {prompt!r}")
+        print(f"out    = {text!r}")
+
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
