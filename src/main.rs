@@ -86,6 +86,13 @@ struct Args {
     #[arg(long, default_value_t = false)]
     recompute_each_step: bool,
 
+    /// 是否启用候选堆（BinaryHeap）来加速“找 best n-gram”。
+    ///
+    /// 注意：heap 会复制一份 n-gram key，带来显著额外内存；
+    /// 在大语料/大 n_max（例如 9）时非常容易触发 OOM。默认关闭。
+    #[arg(long, default_value_t = false)]
+    use_heap: bool,
+
     /// 线程/进程分片数量（0 表示自动=CPU核数）
     #[arg(long, default_value_t = 0)]
     num_workers: usize,
@@ -272,6 +279,7 @@ fn main() -> Result<()> {
         n_values,
         aim_token_num: args.aim_token_num,
         recompute_each_step: args.recompute_each_step,
+        use_heap: args.use_heap,
         num_workers: args.num_workers,
         use_multiprocess: args.multi_process,
     };
@@ -279,7 +287,7 @@ fn main() -> Result<()> {
     log_main(
         "main",
         format!(
-            "start corpus={:?} format={:?} max_docs={:?} output={:?} merges={} aim_token_num={} n_max={} recompute_each_step={} multi_process={} num_workers={}",
+            "start corpus={:?} format={:?} max_docs={:?} output={:?} merges={} aim_token_num={} n_max={} recompute_each_step={} use_heap={} multi_process={} num_workers={}",
             args.corpus,
             fmt,
             max_docs,
@@ -288,6 +296,7 @@ fn main() -> Result<()> {
             args.aim_token_num,
             args.n_max,
             args.recompute_each_step,
+            args.use_heap,
             args.multi_process,
             args.num_workers
         ),

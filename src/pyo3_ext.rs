@@ -81,7 +81,8 @@ fn merge_counts_into(
     aim_token_num=20000,
     n_max=6,
     num_workers=0,
-    multi_process=false
+    multi_process=false,
+    use_heap=false
 ))]
 fn train_to_hf(
     corpus_file: &str,
@@ -91,6 +92,7 @@ fn train_to_hf(
     n_max: usize,
     num_workers: usize,
     multi_process: bool,
+    use_heap: bool,
 ) -> PyResult<()> {
     if n_max < 2 {
         return Err(PyValueError::new_err("n_max must be >= 2"));
@@ -115,6 +117,7 @@ fn train_to_hf(
             n_values,
             aim_token_num,
             recompute_each_step: false,
+            use_heap,
             num_workers,
             use_multiprocess: multi_process,
         };
@@ -142,6 +145,7 @@ fn train_to_hf(
     n_max=6,
     num_workers=0,
     multi_process=false,
+    use_heap=false,
     max_docs=0,
     chunk_size=4096
 ))]
@@ -154,6 +158,7 @@ fn train_to_hf_iter(
     n_max: usize,
     num_workers: usize,
     multi_process: bool,
+    use_heap: bool,
     max_docs: usize,
     chunk_size: usize,
 ) -> PyResult<()> {
@@ -218,6 +223,7 @@ fn train_to_hf_iter(
             n_values,
             aim_token_num,
             recompute_each_step: false,
+            use_heap,
             num_workers,
             use_multiprocess: multi_process,
         };
@@ -250,6 +256,7 @@ fn train_to_hf_iter(
     n_max=6,
     num_workers=0,
     multi_process=false,
+    use_heap=false,
     chunk_size=4096
 ))]
 fn train_to_hf_parquet(
@@ -265,6 +272,7 @@ fn train_to_hf_parquet(
     n_max: usize,
     num_workers: usize,
     multi_process: bool,
+    use_heap: bool,
     chunk_size: usize,
 ) -> PyResult<()> {
     // 依赖 Python 侧 pyarrow 来读取 parquet（不把 arrow/parquet 打进 wheel）
@@ -379,6 +387,7 @@ fn train_to_hf_parquet(
             n_values,
             aim_token_num,
             recompute_each_step: false,
+            use_heap,
             num_workers,
             use_multiprocess: multi_process,
         };

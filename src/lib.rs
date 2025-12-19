@@ -308,6 +308,12 @@ pub struct TokenizerConfig {
     pub n_values: Vec<usize>,
     pub aim_token_num: usize,
     pub recompute_each_step: bool, // 测试/调试用，全量重算统计
+    /// 是否使用候选堆（BinaryHeap）加速 argmax 选择。
+    ///
+    /// 重要：heap 会额外复制一份 n-gram key，带来显著的内存开销；
+    /// 在大语料/大 n_max 时非常容易触发 OOM。
+    /// 因此默认关闭（改为每步扫描 global_stats 选择 best，通常仍然可接受）。
+    pub use_heap: bool,
     pub num_workers: usize,        // 多线程/多进程分片数量（阶段性预留）
     pub use_multiprocess: bool,    // 是否启用多进程 map-reduce
 }
@@ -319,6 +325,7 @@ impl Default for TokenizerConfig {
             n_values: vec![2, 3, 4, 5, 6],
             aim_token_num: 15_000,
             recompute_each_step: false,
+            use_heap: false,
             num_workers: 0,
             use_multiprocess: false,
         }
@@ -332,8 +339,15 @@ pub struct TokenTable {
     pub vocab: HashMap<String, u32>,
 }
 
-/// N-gram Key。预留较大容量以兼容未来更大 n 值，同时避免过大内联占用
-type Ngram = SmallVec<[u32; 16]>;
+/// N-gram Key。
+///
+/// 说明：之前使用 `SmallVec<[u32; 16]>` 会导致每个 key 都内联携带 16 个 `u32`，
+/// 即便 n=2 也会占用很大的内存；在大语料 + 大 n\_max（例如 9）时，
+/// `global_stats`（以及可选 heap）会出现巨大的内存峰值并触发 OOM。
+///
+/// 这里把内联容量调整为 9（覆盖常用的 n\_max<=9 场景）；若用户设置 n\_max>9，
+/// SmallVec 会自动退化为堆分配（功能正确，但可能更慢）。
+type Ngram = SmallVec<[u32; 9]>;
 
 /// 词尾空格占位符，使用单字符与 BPE 风格对齐（原 "</w>"）
 const END_TOKEN: &str = "Ġ";
@@ -788,7 +802,7 @@ impl LengthTokenizer {
                             continue;
                         }
                         for i in 0..=tokens.len() - n {
-                            let mut ng = SmallVec::<[u32; 16]>::with_capacity(n);
+                            let mut ng = SmallVec::<[u32; 9]>::with_capacity(n);
                             ng.extend_from_slice(&tokens[i..i + n]);
                             let e = local.entry(ng).or_default();
                             e.freq += freq;
@@ -1216,17 +1230,20 @@ impl LengthTokenizer {
         log_line(
             "train_single",
             format!(
-                "start merges={} n_values={:?} recompute_each_step={} num_workers={}",
+                "start merges={} n_values={:?} recompute_each_step={} use_heap={} num_workers={}",
                 self.cfg.num_merges,
                 self.cfg.n_values,
                 self.cfg.recompute_each_step,
+                self.cfg.use_heap,
                 self.cfg.num_workers
             ),
         );
         let verify_stats = std::env::var("VERIFY_STATS").is_ok();
         let verify_pre = std::env::var("VERIFY_PRE").is_ok();
-        if !self.cfg.recompute_each_step {
+        if !self.cfg.recompute_each_step && self.cfg.use_heap {
             self.rebuild_heap();
+        } else {
+            self.heap.clear();
         }
         for step in 0..self.cfg.num_merges {
             let t0 = Instant::now();
@@ -1354,8 +1371,35 @@ impl LengthTokenizer {
                     }
                 }
             } else {
-                // 使用堆，避免全表扫描
-                best = self.pop_best_from_heap();
+                if self.cfg.use_heap {
+                    // 使用堆，避免全表扫描（但内存开销大）
+                    best = self.pop_best_from_heap();
+                } else {
+                    // 低内存模式：扫描 global_stats 选择 best（精确 argmax；通常瓶颈在 apply）
+                    let stats_view = &self.global_stats;
+                    fn better_ref<'a>(
+                        a: (&'a Ngram, &'a Stat),
+                        b: (&'a Ngram, &'a Stat),
+                    ) -> (&'a Ngram, &'a Stat) {
+                        let (ang, ast) = a;
+                        let (bng, bst) = b;
+                        if bst.score > ast.score
+                            || (bst.score == ast.score && bng.len() > ang.len())
+                            || (bst.score == ast.score
+                                && bng.len() == ang.len()
+                                && bng.as_slice() > ang.as_slice())
+                        {
+                            (bng, bst)
+                        } else {
+                            (ang, ast)
+                        }
+                    }
+                    best = stats_view
+                        .par_iter()
+                        .filter(|(_, st)| st.freq > 1)
+                        .reduce_with(better_ref)
+                        .map(|(ng, st)| (ng.clone(), st.clone()));
+                }
             }
             let Some((best_parts, best_stat)) = best else { break };
 
@@ -1565,7 +1609,7 @@ impl LengthTokenizer {
                     || (bst.score == ast.score && bng.len() > ang.len())
                     || (bst.score == ast.score
                         && bng.len() == ang.len()
-                        && bng.as_slice() < ang.as_slice())
+                        && bng.as_slice() > ang.as_slice())
                         {
                     b
                 } else {
@@ -1604,7 +1648,7 @@ impl LengthTokenizer {
                         || (bst.score == ast.score && bng.len() > ang.len())
                         || (bst.score == ast.score
                             && bng.len() == ang.len()
-                            && bng.as_slice() < ang.as_slice())
+                            && bng.as_slice() > ang.as_slice())
                     {
                         (bng, bst)
                     } else {
@@ -1953,7 +1997,7 @@ impl LengthTokenizer {
         }
 
         let entries = std::mem::take(&mut self.entries);
-        let deltas: Vec<EntryDelta> = self.with_pool(|| {
+        let mut deltas: Vec<EntryDelta> = self.with_pool(|| {
             entries
                 .into_par_iter()
                 .map_init(
@@ -2065,7 +2109,7 @@ impl LengthTokenizer {
                             for &s in starts {
                                 if s + n <= len_old {
                                     tmp[..n].copy_from_slice(&entry.tokens[s..s + n]);
-                                    let ng = SmallVec::<[u32; 16]>::from_slice(&tmp[..n]);
+                                    let ng = SmallVec::<[u32; 9]>::from_slice(&tmp[..n]);
                                     let e = old_local.entry(ng).or_default();
                                     e.freq += 1;
                                     e.score += n.saturating_sub(1) as u64;
@@ -2085,7 +2129,7 @@ impl LengthTokenizer {
                             for &s in starts {
                                 if s + n <= len_new {
                                     tmp[..n].copy_from_slice(&new_tokens[s..s + n]);
-                                    let ng = SmallVec::<[u32; 16]>::from_slice(&tmp[..n]);
+                                    let ng = SmallVec::<[u32; 9]>::from_slice(&tmp[..n]);
                                     let e = new_local.entry(ng).or_default();
                                     e.freq += 1;
                                     e.score += n.saturating_sub(1) as u64;
@@ -2106,19 +2150,39 @@ impl LengthTokenizer {
 
         // 合并全局统计
         if !self.cfg.recompute_each_step {
-            for delta in &deltas {
+            // 关键优化：
+            // - 这里消费（take）每个 delta 的 old/new local map，用 `accumulate_stats_owned` 避免 `ng.clone()`
+            // - 同时尽早释放每条 entry 的局部统计，降低 apply 阶段峰值内存
+            for delta in deltas.iter_mut() {
                 if !delta.old_local.is_empty() {
-                    Self::accumulate_stats(&mut self.global_stats, &delta.old_local, delta.freq, false, true);
+                    let old_local = std::mem::take(&mut delta.old_local);
+                    if self.cfg.use_heap {
+                        for ng in old_local.keys() {
+                            self.push_candidate(ng);
+                        }
+                    }
+                    Self::accumulate_stats_owned(
+                        &mut self.global_stats,
+                        old_local,
+                        delta.freq,
+                        false,
+                        true,
+                    );
                 }
                 if !delta.new_local.is_empty() {
-                    Self::accumulate_stats(&mut self.global_stats, &delta.new_local, delta.freq, true, true);
-                }
-                // 将受影响的键推入候选堆（懒惰删除保证正确性）
-                for ng in delta.old_local.keys() {
-                    self.push_candidate(ng);
-                }
-                for ng in delta.new_local.keys() {
-                    self.push_candidate(ng);
+                    let new_local = std::mem::take(&mut delta.new_local);
+                    if self.cfg.use_heap {
+                        for ng in new_local.keys() {
+                            self.push_candidate(ng);
+                        }
+                    }
+                    Self::accumulate_stats_owned(
+                        &mut self.global_stats,
+                        new_local,
+                        delta.freq,
+                        true,
+                        true,
+                    );
                 }
             }
         }
@@ -2283,15 +2347,33 @@ impl LengthTokenizer {
     }
 
     fn rebuild_global_stats(&mut self) {
-        let mut g = HashMap::with_hasher(RandomState::new());
-        let n_vals = &self.cfg.n_values;
-        for entry in &self.entries {
-            let local = Self::entry_stats_tokens(&entry.tokens, n_vals);
-            Self::accumulate_stats(&mut g, &local, entry.freq, true, true);
-        }
-        self.global_stats = g;
-        if !self.cfg.recompute_each_step {
+        // 并行重建全局统计（否则大语料下会长时间处于单核运行，给人“卡死”的感觉）。
+        // 注意：此处的内存峰值主要由 global_stats 本身决定；并行仅增加少量局部 map 开销，但能显著加速初始化。
+        let t0 = std::time::Instant::now();
+        log_line(
+            "stats",
+            format!(
+                "rebuild_global_stats start entries={} n_values={:?} num_workers={}",
+                self.entries.len(),
+                self.cfg.n_values,
+                self.cfg.num_workers
+            ),
+        );
+
+        self.global_stats = self.compute_stats_full();
+
+        log_line(
+            "stats",
+            format!(
+                "rebuild_global_stats done keys={} elapsed={:.2}s",
+                self.global_stats.len(),
+                t0.elapsed().as_secs_f32()
+            ),
+        );
+        if !self.cfg.recompute_each_step && self.cfg.use_heap {
             self.rebuild_heap();
+        } else {
+            self.heap.clear();
         }
     }
 
@@ -2312,7 +2394,7 @@ impl LengthTokenizer {
             }
             // 滑窗复制，当前 n 大小
             for i in 0..=len - n {
-                let mut ng = SmallVec::<[u32; 16]>::with_capacity(n);
+                let mut ng = SmallVec::<[u32; 9]>::with_capacity(n);
                 ng.extend_from_slice(&tokens[i..i + n]);
                 let entry = local.entry(ng).or_default();
                 entry.freq += 1;
@@ -3186,7 +3268,7 @@ fn worker_apply_merge(
                                 if s + n <= len_old {
                                     bufs.tmp_ngram[..n]
                                         .copy_from_slice(&tokens[s..s + n]);
-                                    let ng = SmallVec::<[u32; 16]>::from_slice(
+                                    let ng = SmallVec::<[u32; 9]>::from_slice(
                                         &bufs.tmp_ngram[..n],
                                     );
                                     let e = bufs.old_local.entry(ng).or_default();
@@ -3244,7 +3326,7 @@ fn worker_apply_merge(
                                 if s + n <= len_new {
                                     bufs.tmp_ngram[..n]
                                         .copy_from_slice(&tokens[s..s + n]);
-                                    let ng = SmallVec::<[u32; 16]>::from_slice(
+                                    let ng = SmallVec::<[u32; 9]>::from_slice(
                                         &bufs.tmp_ngram[..n],
                                     );
                                     let e = bufs.new_local.entry(ng).or_default();
