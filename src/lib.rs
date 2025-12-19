@@ -557,6 +557,22 @@ pub struct LengthTokenizer {
 }
 
 impl LengthTokenizer {
+    /// 当前 tokenizer 的词表大小（包含 HF 导出时会加入的 special tokens）。
+    ///
+    /// 说明：
+    /// - 训练过程中 `Interner` 只包含“实际合并产生/语料中出现”的 token（不含 `<unk>` 等 special tokens）
+    /// - 但导出 HF tokenizer 目录时会额外注入固定 5 个 special tokens
+    /// - 因此 `aim_token_num` 更符合“导出后最终 vocab size”的语义
+    fn vocab_size_with_specials(&self) -> usize {
+        let mut n = self.interner.id_to_token.len();
+        for s in ["<unk>", "<pad>", "<s>", "</s>", "<mask>"] {
+            if !self.interner.token_to_id.contains_key(s) {
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// 预估窗口总数，用于 HashMap 预分配，减少扩容开销
     #[inline]
     fn estimate_windows(len: usize, n_vals: &[usize]) -> usize {
@@ -1444,6 +1460,24 @@ impl LengthTokenizer {
                 ),
             );
 
+            // 目标词表大小：达到后提前停止（避免必须手动精确设置 num_merges）
+            if self.cfg.aim_token_num > 0 {
+                let vocab_sz = self.vocab_size_with_specials();
+                if vocab_sz >= self.cfg.aim_token_num {
+                    log_line(
+                        "train_single",
+                        format!(
+                            "reach aim_token_num={} (vocab_size={}), stop at step {} (elapsed_total={:.2}s)",
+                            self.cfg.aim_token_num,
+                            vocab_sz,
+                            step + 1,
+                            start_all.elapsed().as_secs_f32()
+                        ),
+                    );
+                    break;
+                }
+            }
+
             // 可选：验证增量统计的正确性（开启环境变量 VERIFY_STATS）
             if verify_stats && !self.cfg.recompute_each_step {
                 let full = self.compute_stats_full();
@@ -1847,6 +1881,24 @@ impl LengthTokenizer {
                     start_all.elapsed().as_secs_f32()
                 ),
             );
+
+            // 目标词表大小：达到后提前停止（多进程路径）。
+            if self.cfg.aim_token_num > 0 {
+                let vocab_sz = self.vocab_size_with_specials();
+                if vocab_sz >= self.cfg.aim_token_num {
+                    log_line(
+                        "train_mp",
+                        format!(
+                            "reach aim_token_num={} (vocab_size={}), stop at step {} (elapsed_total={:.2}s)",
+                            self.cfg.aim_token_num,
+                            vocab_sz,
+                            step + 1,
+                            start_all.elapsed().as_secs_f32()
+                        ),
+                    );
+                    break;
+                }
+            }
 
             // 可选：校验增量统计是否与全量重算一致（仅在 VERIFY_STATS_MP=1 时启用，方便定位 drift）
             if !self.cfg.recompute_each_step && std::env::var("VERIFY_STATS_MP").is_ok() {
