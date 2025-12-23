@@ -22,6 +22,12 @@ venv/
 # --- Large data / generated artifacts (do not commit) ---
 *.log
 /length_tokenizer.log
+*.png
+*.pdf
+*.jpg
+*.webp
+*.csv
+*.out
 
 # corpora
 /corpus_*.txt
@@ -35,6 +41,24 @@ venv/
 # token tables (can be regenerated; some are multi-GB)
 /token_table*.json
 /token_table_safe*.json
+
+## training / experiment outputs (large; reproducible)
+/run_llama_*/
+/run_llama_*.log
+/pipeline_*.log
+/driver_*.log
+/loss_curve*
+/loss_overlay*
+/bpc_overlay*
+/loss_sync_*/
+/ckpt_*/
+/model_*/
+/tokenizer_out_*/
+/exp_*/
+/dist_default_*/
+/dist_full_*/
+/_ckpt_test_save/
+
 
 
 

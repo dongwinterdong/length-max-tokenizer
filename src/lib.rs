@@ -1389,7 +1389,7 @@ impl LengthTokenizer {
             } else {
                 if self.cfg.use_heap {
                     // 使用堆，避免全表扫描（但内存开销大）
-                    best = self.pop_best_from_heap();
+                best = self.pop_best_from_heap();
                 } else {
                     // 低内存模式：扫描 global_stats 选择 best（精确 argmax；通常瓶颈在 apply）
                     let stats_view = &self.global_stats;
@@ -1533,6 +1533,12 @@ impl LengthTokenizer {
 
         let start_total = Instant::now();
         let force_inc = std::env::var("MP_FORCE_INCREMENTAL").is_ok();
+        // 默认启用增量模式（更快、也更符合“每轮 apply 越来越少所以越跑越快”的直觉）。
+        // 如需强制走“每步全量重算 stats”（更慢，但便于 debug/对照），可设置：
+        //   MP_FULL_RECOMPUTE=1   或   MP_NO_INCREMENTAL=1
+        let full_recompute =
+            std::env::var("MP_FULL_RECOMPUTE").is_ok() || std::env::var("MP_NO_INCREMENTAL").is_ok();
+        let allow_incremental = !full_recompute;
         // 多进程下 heap 容易被“增量更新大量 key”撑爆（并导致主进程 OOM）。
         // 默认关闭：改用扫描 global_stats 选 best（仍是精确 argmax，只是更省内存）。
         // 如需启用 heap：设置 MP_USE_HEAP=1
@@ -1573,7 +1579,7 @@ impl LengthTokenizer {
         );
         if mp_use_heap
             && !self.cfg.recompute_each_step
-            && (force_inc || std::env::var("MP_INCREMENTAL").is_ok())
+            && (force_inc || allow_incremental)
             && !low_mem
         {
             self.rebuild_heap();
@@ -1600,7 +1606,7 @@ impl LengthTokenizer {
             let t0 = Instant::now();
             let stats_ref: HashMap<Ngram, Stat, RandomState>;
             let use_incremental = !self.cfg.recompute_each_step
-                && (force_inc || std::env::var("MP_INCREMENTAL").is_ok())
+                && (force_inc || allow_incremental)
                 && !low_mem;
             let stats_view: &HashMap<Ngram, Stat, RandomState> = if self.cfg.recompute_each_step
                 || !use_incremental
@@ -1739,9 +1745,33 @@ impl LengthTokenizer {
                     (0..bucket_cnt).collect()
                 };
 
-                for b in buckets_to_read {
-                    let mut bucket_old: HashMap<Ngram, Stat, RandomState> = HashMap::with_hasher(RandomState::new());
-                    let mut bucket_new: HashMap<Ngram, Stat, RandomState> = HashMap::with_hasher(RandomState::new());
+                // 性能关键路径：主进程读取并合并 diff 桶文件。
+                //
+                // 旧实现按 bucket 串行读取，容易出现“CPU 用不满，但 apply 很慢”的现象（尤其在前期 diff 很大时）。
+                // 这里改为 **分批并行** 读取 bucket：每批并行构建 bucket_old/new，再在主线程顺序更新 global_stats，
+                // 以在不显著抬高峰值内存的前提下，尽量把 CPU/IO 利用起来。
+                let bucket_batch: usize = std::env::var("MP_BUCKET_BATCH")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    // 默认值偏向“高吞吐”（可通过 MP_BUCKET_BATCH 调小以降低峰值内存）
+                    .unwrap_or(256)
+                    .clamp(1, 8192);
+
+                for batch in buckets_to_read.chunks(bucket_batch) {
+                    // (old, new, any)
+                    let mut results: Vec<(
+                        HashMap<Ngram, Stat, RandomState>,
+                        HashMap<Ngram, Stat, RandomState>,
+                        bool,
+                    )> = batch
+                        .par_iter()
+                        .map(|&b| {
+                            let mut bucket_old: HashMap<Ngram, Stat, RandomState> =
+                                HashMap::with_hasher(RandomState::new());
+                            let mut bucket_new: HashMap<Ngram, Stat, RandomState> =
+                                HashMap::with_hasher(RandomState::new());
+                            let mut any = false;
+
                     for (wi, wdir) in worker_dirs.iter().enumerate() {
                         // 有 manifest 时用位图过滤，否则 fallback 走 open 失败即跳过
                         let (has_old, has_new) = if manifest_ok {
@@ -1753,42 +1783,77 @@ impl LengthTokenizer {
 
                         if has_old {
                             let p_old = wdir.join(format!("old_{b}.bin"));
-                            if let Ok(any) = read_bucket_file_into(&p_old, &mut bucket_old) {
-                                if any {
-                                    any_change = true;
-                                }
+                                    if let Ok(any_read) =
+                                        read_bucket_file_into(&p_old, &mut bucket_old)
+                                    {
+                                        any |= any_read;
                                 // 读完立刻删除，尤其在 TMPDIR=/dev/shm 时可显著降低内存峰值
                                 let _ = fs::remove_file(&p_old);
                             }
                         }
                         if has_new {
                             let p_new = wdir.join(format!("new_{b}.bin"));
-                            if let Ok(any) = read_bucket_file_into(&p_new, &mut bucket_new) {
-                                if any {
-                                    any_change = true;
-                                }
+                                    if let Ok(any_read) =
+                                        read_bucket_file_into(&p_new, &mut bucket_new)
+                                    {
+                                        any |= any_read;
                                 let _ = fs::remove_file(&p_new);
                             }
                         }
+                            }
+
+                            (bucket_old, bucket_new, any)
+                        })
+                        .collect();
+
+                    for (bucket_old, bucket_new, any) in results.drain(..) {
+                        if any {
+                            any_change = true;
                     }
 
                     if !bucket_old.is_empty() {
                         // 只保留 freq>1，减少 global_stats 体积；不会影响可合并候选集合
                         if mp_use_heap {
-                            Self::accumulate_stats(&mut self.global_stats, &bucket_old, 1, false, true);
+                                Self::accumulate_stats(
+                                    &mut self.global_stats,
+                                    &bucket_old,
+                                    1,
+                                    false,
+                                    true,
+                                );
                         } else {
-                            Self::accumulate_stats_owned(&mut self.global_stats, bucket_old, 1, false, true);
+                                Self::accumulate_stats_owned(
+                                    &mut self.global_stats,
+                                    bucket_old,
+                                    1,
+                                    false,
+                                    true,
+                                );
                         }
                     }
+
                     if !bucket_new.is_empty() {
                         if mp_use_heap {
-                            Self::accumulate_stats(&mut self.global_stats, &bucket_new, 1, true, true);
+                                Self::accumulate_stats(
+                                    &mut self.global_stats,
+                                    &bucket_new,
+                                    1,
+                                    true,
+                                    true,
+                                );
                             for k in bucket_new.keys() {
                                 // 对“增加项”必须 push：否则 score 变大但堆里仍是旧的低分，会选错 best（影响功能正确性）
                                 self.push_candidate(k);
                             }
                         } else {
-                            Self::accumulate_stats_owned(&mut self.global_stats, bucket_new, 1, true, true);
+                                Self::accumulate_stats_owned(
+                                    &mut self.global_stats,
+                                    bucket_new,
+                                    1,
+                                    true,
+                                    true,
+                                );
+                            }
                         }
                     }
                 }
@@ -1992,10 +2057,32 @@ impl LengthTokenizer {
             }
         }
 
-        // 收尾：取回各 worker 的 entries，重建全局统计，关闭进程
+        // 收尾：取回各 worker 的 entries，并关闭进程。
+        //
+        // 注意：在多进程训练路径中，`global_stats`/heap 在训练过程中可能非常大。
+        // 如果在收尾阶段再做一次 `rebuild_global_stats()`（它会做一次“全量 n-gram 统计”），
+        // 很容易在短时间内触发巨大的内存峰值（甚至被 OOM killer 直接杀掉）。
+        //
+        // 对于常见用法（训练后直接导出 HF tokenizer / token_table），收尾阶段并不需要重建全局统计。
+        // 如确实需要（调试/诊断），可通过环境变量显式开启：
+        //   FINAL_REBUILD_GLOBAL_STATS=1
+        let do_final_rebuild = std::env::var("FINAL_REBUILD_GLOBAL_STATS").is_ok();
+
+        // 尽早释放候选堆，降低内存峰值
+        self.heap.clear();
+        if !do_final_rebuild {
+            // 直接 drop 掉训练期间累积的全局统计，避免“entries 回收 + 重建统计”叠加导致 OOM
+            self.global_stats = HashMap::with_hasher(RandomState::new());
+        }
+
         self.entries = pool.collect_entries()?;
         pool.shutdown();
+
+        if do_final_rebuild {
+            // 先 drop 旧表，避免出现“两份巨大的 global_stats 同时存在”的峰值
+            self.global_stats = HashMap::with_hasher(RandomState::new());
         self.rebuild_global_stats();
+        }
 
         // 训练后基于最终 entries 计算 token 总数，并按字符总数输出 TPC（tok/char）
         let total_tokens = Self::total_tokens(&self.entries);
@@ -2225,7 +2312,7 @@ impl LengthTokenizer {
                     let new_local = std::mem::take(&mut delta.new_local);
                     if self.cfg.use_heap {
                         for ng in new_local.keys() {
-                            self.push_candidate(ng);
+                    self.push_candidate(ng);
                         }
                     }
                     Self::accumulate_stats_owned(
@@ -2709,8 +2796,25 @@ impl ProcessPool {
     fn new(chunks: Vec<Vec<SeqEntry>>, n_values: Vec<usize>) -> Result<Self> {
         let exe = std::env::current_exe()?;
         let mut workers = Vec::new();
+
+        // 默认 worker 线程数：避免每个 worker 都使用 num_cpus() 导致严重超额并发（性能反而下降）。
+        // 如果用户显式设置了 WORKER_THREADS，则尊重用户设置。
+        let default_worker_threads: Option<String> = if std::env::var("WORKER_THREADS").is_ok() {
+            None
+        } else {
+            let total = num_cpus::get().max(1);
+            let worker_total = chunks.len().max(1);
+            let per = (total / worker_total).max(1);
+            // 限制上限，避免 worker_total 较小时每个 worker 开太多线程造成抖动/内存膨胀
+            let per = per.clamp(1, 4);
+            Some(per.to_string())
+        };
+
         for (idx, entries) in chunks.into_iter().enumerate() {
             let mut cmd = Command::new(&exe);
+            if let Some(ref v) = default_worker_threads {
+                cmd.env("WORKER_THREADS", v);
+            }
             if std::env::var("MP_PY_WORKER").is_ok() {
                 cmd.arg("-c").arg("import length_tokenizer_rs as m; m._run_worker()");
             } else {
@@ -2840,10 +2944,20 @@ impl ProcessPool {
             .unwrap_or_else(|| (self.workers.len().next_power_of_two()).max(1024));
         let bucket_cnt = bucket_cnt.next_power_of_two().max(64);
 
-        // 优先使用 TMPDIR（例如 /dev/shm）作为临时目录
+        // 临时目录选择顺序：
+        // 1) 用户显式设置 TMPDIR
+        // 2) Linux 下优先 /dev/shm（内存盘，明显加速 diff 桶文件读写）
+        // 3) 系统默认 temp_dir
         let base_tmp = std::env::var("TMPDIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir());
+            .unwrap_or_else(|_| {
+                let shm = PathBuf::from("/dev/shm");
+                if shm.is_dir() {
+                    shm
+                } else {
+                    std::env::temp_dir()
+                }
+            });
         let temp_root = base_tmp.join(format!(
             "lt_apply_{}_{}",
             std::process::id(),

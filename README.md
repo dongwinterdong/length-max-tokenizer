@@ -17,6 +17,34 @@ If your corpus is parquet (or you want streaming reads via pyarrow):
 pip install pyarrow
 ```
 
+#### 1.1 GitHub Actions / CI install
+
+- **Option A (recommended)**: publish via GitHub Actions (this repo) and install from PyPI.
+  - In GitHub repo settings → **Secrets and variables** → **Actions**, add:
+    - `PYPI_API_TOKEN`: your PyPI token (project-scoped recommended).
+  - Bump version in `pyproject.toml` / `Cargo.toml`, then create and push a tag like `v0.1.9`.
+  - The workflow `/.github/workflows/publish_pypi.yml` will build wheels (Linux/macOS/Windows) + sdist and publish.
+  - Then in any CI (or locally):
+
+```bash
+pip install length-tokenizer-rs==0.1.9
+```
+
+- **Option B**: build-from-source install inside GitHub Actions (no PyPI needed).
+  - This compiles the Rust extension during CI.
+
+```yaml
+- uses: actions/checkout@v4
+- uses: actions/setup-python@v5
+  with:
+    python-version: "3.10"
+- uses: PyO3/maturin-action@v1
+  with:
+    command: develop
+    args: --release
+- run: python -c "import length_tokenizer_rs; print(length_tokenizer_rs.__version__)"
+```
+
 #### 2) Train a vocab from your corpus (export a local tokenizer directory)
 
 After training you will get a directory (e.g. `./tokenizer_out/`) containing:
@@ -72,7 +100,18 @@ train_to_hf_parquet(
   - `n_max=9`
   - `num_workers=64`（按 CPU 资源调整）
   - `use_heap=False`（默认，强烈建议保持）
-  - `multi_process=False`（默认；若你希望进一步隔离峰值内存/更稳定，可尝试 `True`）
+  - `multi_process=True`（**推荐大语料**：更稳定，也便于利用增量 apply 优化）
+
+- **默认高效行为（无需额外设置）**：当 `multi_process=True` 时，本实现会默认开启一组“高吞吐/低峰值”的策略：
+  - 默认启用 **增量模式**（不再每步全量重算 stats）
+  - 默认将 diff 临时文件优先写到 **`/dev/shm`**（Linux 内存盘；若不存在则回退到系统 temp 目录）
+  - 默认给每个 worker 设置一个“不过量”的线程数（避免 64 个 worker 各自开满 128 线程导致抖动）
+  - 默认使用较大的 `MP_BUCKET_BATCH` 以提升主进程合并桶文件的并行度
+
+- **仍可覆盖**（仅在你需要 debug/保守模式时）：
+  - `MP_FULL_RECOMPUTE=1` 或 `MP_NO_INCREMENTAL=1`：强制每步全量重算（更慢）
+  - `WORKER_THREADS=1`：限制 worker 内部线程（更稳、但可能更慢）
+  - `MP_BUCKET_BATCH=64`：降低主进程并行读桶批大小（降低峰值内存）
 
 - **日志重定向（很重要）**：训练日志默认写到 **stderr**，如果你用 `tee` 记日志，需要把 stderr 合并到 stdout：
 
