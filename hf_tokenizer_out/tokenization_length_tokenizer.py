@@ -44,7 +44,36 @@ class _TrieNode:
 class _TokenTrie:
     def __init__(self, vocab: Dict[str, int]) -> None:
         self.nodes: List[_TrieNode] = [_TrieNode()]
+        forbid_end_inner = os.environ.get("LENGTH_TOKENIZER_FORBID_END_INNER") is not None
+        cross_word_whole_only = (not forbid_end_inner) and (
+            os.environ.get("LENGTH_TOKENIZER_CROSS_WORD_WHOLE_ONLY") is not None
+        )
+        forbid_punct_tokens = os.environ.get("LENGTH_TOKENIZER_FORBID_PUNCT_TOKENS") is not None
+
+        def has_hard_punct(tok: str) -> bool:
+            # Treat ANY non-alphanumeric char (excluding END_TOKEN) as punctuation/symbol.
+            for ch in tok:
+                if ch == END_TOKEN:
+                    continue
+                if not ch.isalnum():
+                    return True
+            return False
+        # token ids that must start at a word boundary (i==0 or previous char is END_TOKEN)
+        self._require_word_start: set[int] = set()
         for tok, tid in vocab.items():
+            if forbid_punct_tokens and len(tok) > 1 and has_hard_punct(tok):
+                continue
+            end_inner = END_TOKEN in tok[:-1]
+            if forbid_end_inner and end_inner:
+                continue
+            if cross_word_whole_only and end_inner:
+                # Cross-word token must end with END_TOKEN, otherwise it ends mid-word.
+                if not tok.endswith(END_TOKEN):
+                    continue
+                # Also require token begins with a non-END char (i.e., starts with a word).
+                if tok.startswith(END_TOKEN):
+                    continue
+                self._require_word_start.add(int(tid))
             self._insert(tok, tid)
 
     def _insert(self, tok: str, tid: int) -> None:
@@ -71,6 +100,7 @@ class _TokenTrie:
 
         for i in range(n - 1, -1, -1):
             node = 0
+            at_word_start = i == 0 or s[i - 1] == END_TOKEN
             # 枚举所有从 i 开始的 token
             for j in range(i, n):
                 ch = s[j]
@@ -80,6 +110,8 @@ class _TokenTrie:
                 node = nxt
                 tid = self.nodes[node].term_id
                 if tid is not None:
+                    if tid in self._require_word_start and not at_word_start:
+                        continue
                     cand = 1 + dp[j + 1]
                     better = False
                     if cand < dp[i]:

@@ -32,10 +32,57 @@ use crate::{hf_export, LengthTokenizer, TokenTrie, TokenizerConfig};
 const END_TOKEN: &str = "Ġ";
 const UNK: &str = "<unk>";
 
+fn forbid_end_inner_enabled() -> bool {
+    // If set, we forbid tokens that contain END_TOKEN ('Ġ') anywhere except the last char.
+    // This effectively prevents cross-word tokens in our whitespace+END normalization scheme.
+    env::var("LENGTH_TOKENIZER_FORBID_END_INNER").is_ok()
+}
+
+fn cross_word_whole_only_enabled() -> bool {
+    // If set, we allow cross-word tokens only if they cover whole words:
+    // - token ends with END_TOKEN
+    // - token starts at a word start position (enforced in DP by requiring word-start)
+    env::var("LENGTH_TOKENIZER_CROSS_WORD_WHOLE_ONLY").is_ok()
+}
+
+fn forbid_punct_tokens_enabled() -> bool {
+    // If set, we forbid using any *multi-character* token that contains hard punctuation.
+    // (Single-character punctuation tokens are still allowed, otherwise punctuation would become <unk>.)
+    env::var("LENGTH_TOKENIZER_FORBID_PUNCT_TOKENS").is_ok()
+}
+
+#[inline]
+fn has_end_before_last(tok: &str) -> bool {
+    // True if END_TOKEN appears and is NOT the last character.
+    // Use char iteration (UTF-8 safe): 'Ġ' is multi-byte.
+    let mut it = tok.chars().peekable();
+    while let Some(ch) = it.next() {
+        if ch == 'Ġ' && it.peek().is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn has_hard_punct(tok: &str) -> bool {
+    for ch in tok.chars() {
+        if ch == 'Ġ' {
+            continue;
+        }
+        if !ch.is_alphanumeric() {
+            return true;
+        }
+    }
+    false
+}
+
 #[pyclass]
 struct DpTokenizer {
     trie: TokenTrie,
     unk_id: u32,
+    require_word_start: Vec<u8>,
+    cross_word_whole_only: bool,
 }
 
 fn build_counts_chunk(
@@ -80,9 +127,22 @@ fn merge_counts_into(
     num_merges=50000,
     aim_token_num=20000,
     n_max=6,
+    max_token_chars=0,
     num_workers=0,
     multi_process=false,
-    use_heap=false
+    use_heap=false,
+    n_min=2,
+    forbid_punct_word_mix=false,
+    forbid_punct_tokens=false,
+    allow_space_punct_tokens=false,
+    allow_abbrev_tokens=false,
+    allow_hyphen_tokens=false,
+    allow_word_final_punct_tokens=false,
+    allow_apostrophe_tokens=false,
+    allow_cross_word_punct_word_mix_tokens=false,
+    cross_word_start_vocab=0,
+    max_token_words=0,
+    forbid_incomplete_cross_word=false
 ))]
 fn train_to_hf(
     corpus_file: &str,
@@ -90,12 +150,28 @@ fn train_to_hf(
     num_merges: usize,
     aim_token_num: usize,
     n_max: usize,
+    max_token_chars: usize,
     num_workers: usize,
     multi_process: bool,
     use_heap: bool,
+    n_min: usize,
+    forbid_punct_word_mix: bool,
+    forbid_punct_tokens: bool,
+    allow_space_punct_tokens: bool,
+    allow_abbrev_tokens: bool,
+    allow_hyphen_tokens: bool,
+    allow_word_final_punct_tokens: bool,
+    allow_apostrophe_tokens: bool,
+    allow_cross_word_punct_word_mix_tokens: bool,
+    cross_word_start_vocab: usize,
+    max_token_words: usize,
+    forbid_incomplete_cross_word: bool,
 ) -> PyResult<()> {
-    if n_max < 2 {
-        return Err(PyValueError::new_err("n_max must be >= 2"));
+    if n_min < 2 {
+        return Err(PyValueError::new_err("n_min must be >= 2"));
+    }
+    if n_max < n_min {
+        return Err(PyValueError::new_err("n_max must be >= n_min"));
     }
 
     // multi-process 在 Python 进程内需要额外的 worker 启动方式；通过 MP_PY_WORKER 切换。
@@ -111,11 +187,23 @@ fn train_to_hf(
         if corpus.is_empty() {
             anyhow::bail!("corpus is empty: {corpus_file}");
         }
-        let n_values: Vec<usize> = (2..=n_max).collect();
+        let n_values: Vec<usize> = (n_min..=n_max).collect();
         let cfg = TokenizerConfig {
             num_merges,
             n_values,
             aim_token_num,
+            max_token_chars,
+            forbid_punct_word_mix,
+            forbid_punct_tokens,
+            allow_space_punct_tokens,
+            allow_abbrev_tokens,
+            allow_hyphen_tokens,
+            allow_word_final_punct_tokens,
+            allow_apostrophe_tokens,
+            allow_cross_word_punct_word_mix_tokens,
+            cross_word_start_vocab,
+            max_token_words,
+            forbid_incomplete_cross_word,
             recompute_each_step: false,
             use_heap,
             num_workers,
@@ -143,11 +231,24 @@ fn train_to_hf(
     num_merges=50000,
     aim_token_num=20000,
     n_max=6,
+    max_token_chars=0,
     num_workers=0,
     multi_process=false,
     use_heap=false,
     max_docs=0,
-    chunk_size=4096
+    chunk_size=4096,
+    n_min=2,
+    forbid_punct_word_mix=false,
+    forbid_punct_tokens=false,
+    allow_space_punct_tokens=false,
+    allow_abbrev_tokens=false,
+    allow_hyphen_tokens=false,
+    allow_word_final_punct_tokens=false,
+    allow_apostrophe_tokens=false,
+    allow_cross_word_punct_word_mix_tokens=false,
+    cross_word_start_vocab=0,
+    max_token_words=0,
+    forbid_incomplete_cross_word=false
 ))]
 fn train_to_hf_iter(
     py: Python<'_>,
@@ -156,14 +257,30 @@ fn train_to_hf_iter(
     num_merges: usize,
     aim_token_num: usize,
     n_max: usize,
+    max_token_chars: usize,
     num_workers: usize,
     multi_process: bool,
     use_heap: bool,
     max_docs: usize,
     chunk_size: usize,
+    n_min: usize,
+    forbid_punct_word_mix: bool,
+    forbid_punct_tokens: bool,
+    allow_space_punct_tokens: bool,
+    allow_abbrev_tokens: bool,
+    allow_hyphen_tokens: bool,
+    allow_word_final_punct_tokens: bool,
+    allow_apostrophe_tokens: bool,
+    allow_cross_word_punct_word_mix_tokens: bool,
+    cross_word_start_vocab: usize,
+    max_token_words: usize,
+    forbid_incomplete_cross_word: bool,
 ) -> PyResult<()> {
-    if n_max < 2 {
-        return Err(PyValueError::new_err("n_max must be >= 2"));
+    if n_min < 2 {
+        return Err(PyValueError::new_err("n_min must be >= 2"));
+    }
+    if n_max < n_min {
+        return Err(PyValueError::new_err("n_max must be >= n_min"));
     }
     if chunk_size == 0 {
         return Err(PyValueError::new_err("chunk_size must be >= 1"));
@@ -217,11 +334,23 @@ fn train_to_hf_iter(
             anyhow::bail!("no training texts (empty iterator?)");
         }
 
-        let n_values: Vec<usize> = (2..=n_max).collect();
+        let n_values: Vec<usize> = (n_min..=n_max).collect();
         let cfg = TokenizerConfig {
             num_merges,
             n_values,
             aim_token_num,
+            max_token_chars,
+            forbid_punct_word_mix,
+            forbid_punct_tokens,
+            allow_space_punct_tokens,
+            allow_abbrev_tokens,
+            allow_hyphen_tokens,
+            allow_word_final_punct_tokens,
+            allow_apostrophe_tokens,
+            allow_cross_word_punct_word_mix_tokens,
+            cross_word_start_vocab,
+            max_token_words,
+            forbid_incomplete_cross_word,
             recompute_each_step: false,
             use_heap,
             num_workers,
@@ -254,10 +383,23 @@ fn train_to_hf_iter(
     num_merges=50000,
     aim_token_num=20000,
     n_max=6,
+    max_token_chars=0,
     num_workers=0,
     multi_process=false,
     use_heap=false,
-    chunk_size=4096
+    chunk_size=4096,
+    n_min=2,
+    forbid_punct_word_mix=false,
+    forbid_punct_tokens=false,
+    allow_space_punct_tokens=false,
+    allow_abbrev_tokens=false,
+    allow_hyphen_tokens=false,
+    allow_word_final_punct_tokens=false,
+    allow_apostrophe_tokens=false,
+    allow_cross_word_punct_word_mix_tokens=false,
+    cross_word_start_vocab=0,
+    max_token_words=0,
+    forbid_incomplete_cross_word=false
 ))]
 fn train_to_hf_parquet(
     py: Python<'_>,
@@ -270,10 +412,23 @@ fn train_to_hf_parquet(
     num_merges: usize,
     aim_token_num: usize,
     n_max: usize,
+    max_token_chars: usize,
     num_workers: usize,
     multi_process: bool,
     use_heap: bool,
     chunk_size: usize,
+    n_min: usize,
+    forbid_punct_word_mix: bool,
+    forbid_punct_tokens: bool,
+    allow_space_punct_tokens: bool,
+    allow_abbrev_tokens: bool,
+    allow_hyphen_tokens: bool,
+    allow_word_final_punct_tokens: bool,
+    allow_apostrophe_tokens: bool,
+    allow_cross_word_punct_word_mix_tokens: bool,
+    cross_word_start_vocab: usize,
+    max_token_words: usize,
+    forbid_incomplete_cross_word: bool,
 ) -> PyResult<()> {
     // 依赖 Python 侧 pyarrow 来读取 parquet（不把 arrow/parquet 打进 wheel）
     let ds = py
@@ -322,8 +477,11 @@ fn train_to_hf_parquet(
     let mut seen: usize = 0;
 
     // 先准备训练参数配置（复用 train_to_hf_iter 的实现思路，但 parquet 这边我们直接喂 Rust Strings）
-    if n_max < 2 {
-        return Err(PyValueError::new_err("n_max must be >= 2"));
+    if n_min < 2 {
+        return Err(PyValueError::new_err("n_min must be >= 2"));
+    }
+    if n_max < n_min {
+        return Err(PyValueError::new_err("n_max must be >= n_min"));
     }
     if chunk_size == 0 {
         return Err(PyValueError::new_err("chunk_size must be >= 1"));
@@ -381,11 +539,23 @@ fn train_to_hf_parquet(
             anyhow::bail!("no training texts read from parquet");
         }
 
-        let n_values: Vec<usize> = (2..=n_max).collect();
+        let n_values: Vec<usize> = (n_min..=n_max).collect();
         let cfg = TokenizerConfig {
             num_merges,
             n_values,
             aim_token_num,
+            max_token_chars,
+            forbid_punct_word_mix,
+            forbid_punct_tokens,
+            allow_space_punct_tokens,
+            allow_abbrev_tokens,
+            allow_hyphen_tokens,
+            allow_word_final_punct_tokens,
+            allow_apostrophe_tokens,
+            allow_cross_word_punct_word_mix_tokens,
+            cross_word_start_vocab,
+            max_token_words,
+            forbid_incomplete_cross_word,
             recompute_each_step: false,
             use_heap,
             num_workers,
@@ -430,33 +600,78 @@ impl DpTokenizer {
             .ok_or_else(|| PyValueError::new_err(format!("unk_token {unk:?} not found in vocab")))?;
 
         // 构建 trie（term_id = token id）
+        let forbid_end_inner = forbid_end_inner_enabled();
+        let cross_word_whole_only = (!forbid_end_inner) && cross_word_whole_only_enabled();
+        let forbid_punct_tokens = forbid_punct_tokens_enabled();
         let mut trie = TokenTrie::new();
+        let max_id = vocab.values().copied().max().unwrap_or(0) as usize;
+        let mut require_word_start: Vec<u8> = vec![0u8; max_id.saturating_add(1)];
         // 注意：HashMap 遍历无序，但这里只依赖 term_id，插入顺序无关
         for (tok, &id) in &vocab {
+            if forbid_punct_tokens && tok.chars().count() > 1 && has_hard_punct(tok) {
+                continue;
+            }
+            let end_inner = has_end_before_last(tok);
+            if forbid_end_inner && end_inner {
+                continue;
+            }
+            if cross_word_whole_only && end_inner {
+                // Cross-word token must end with END_TOKEN, otherwise it would end mid-word.
+                if !tok.ends_with(END_TOKEN) {
+                    continue;
+                }
+                // Also require token itself begins with a non-END char, i.e. it starts with a word.
+                // (This matches the notion "token covers complete words".)
+                if tok.starts_with(END_TOKEN) {
+                    continue;
+                }
+                // Mark as requiring word-start position in DP.
+                if (id as usize) < require_word_start.len() {
+                    require_word_start[id as usize] = 1;
+                }
+            }
             trie.insert(tok, id);
         }
 
-        Ok(Self { trie, unk_id })
+        Ok(Self {
+            trie,
+            unk_id,
+            require_word_start,
+            cross_word_whole_only,
+        })
     }
 
     /// encode：返回 token id 列表（DP 最少 token，无法匹配时用 unk 兜底）
     fn encode(&self, text: &str) -> Vec<u32> {
         // 复刻 Rust 训练口径：split_whitespace + 每词追加 END_TOKEN
         let chars = LengthTokenizer::normalize_chars(text);
-        self.trie.dp_min_ids_allow_unk(&chars, self.unk_id)
+        if self.cross_word_whole_only {
+            let end_ch = END_TOKEN.chars().next().unwrap_or('Ġ');
+            self.trie
+                .dp_min_ids_allow_unk_require_word_start(&chars, self.unk_id, &self.require_word_start, end_ch)
+        } else {
+            self.trie.dp_min_ids_allow_unk(&chars, self.unk_id)
+        }
     }
 
     /// 批量 encode：释放 GIL，适合大吞吐
     fn encode_batch(&self, py: Python<'_>, texts: Vec<String>) -> PyResult<Vec<Vec<u32>>> {
         let trie = &self.trie;
         let unk_id = self.unk_id;
+        let cross_word_whole_only = self.cross_word_whole_only;
+        let require_word_start = &self.require_word_start;
+        let end_ch = END_TOKEN.chars().next().unwrap_or('Ġ');
         py.allow_threads(|| {
             Ok(texts
                 // rayon：并行处理 batch（collect 保持原顺序）
                 .into_par_iter()
                 .map(|t| {
                     let chars = LengthTokenizer::normalize_chars(&t);
-                    trie.dp_min_ids_allow_unk(&chars, unk_id)
+                    if cross_word_whole_only {
+                        trie.dp_min_ids_allow_unk_require_word_start(&chars, unk_id, require_word_start, end_ch)
+                    } else {
+                        trie.dp_min_ids_allow_unk(&chars, unk_id)
+                    }
                 })
                 .collect())
         })

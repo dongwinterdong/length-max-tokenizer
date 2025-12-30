@@ -307,6 +307,90 @@ pub struct TokenizerConfig {
     pub num_merges: usize,
     pub n_values: Vec<usize>,
     pub aim_token_num: usize,
+    /// 限制新生成 token 的最大字符长度（0 表示不限制）。
+    ///
+    /// 目的：避免出现极长、极稀疏的“句子级 token”。这些 token 往往会降低 LM 的可组合性与泛化，
+    /// 同时也会让 embedding 更新更稀疏，影响 bpc 收敛。
+    pub max_token_chars: usize,
+    /// 禁止生成“混合硬标点 + 词元(字母数字)”的新 token（训练阶段过滤候选 merge）。
+    ///
+    /// 目的：避免出现诸如 `"Ġ,ĠandĠ`、`")ĠandĠ` 这类“标点+词”拼在一起的 token，
+    /// 这些 token 可能提高 token-level 的可预测性难度，并损害 bpc。
+    pub forbid_punct_word_mix: bool,
+    /// 禁止生成“包含硬标点（ASCII 标点，排除 ' 与 -）”的新 token（训练阶段过滤候选 merge）。
+    ///
+    /// 注意：这不会删除/禁用 **单字符** 的标点 token（否则无法编码标点字符），
+    /// 但会阻止把标点与其他字符（含 END_TOKEN）合并成更长 token（例如 ",Ġ", ".Ġ", "\"Ġ" 等）。
+    pub forbid_punct_tokens: bool,
+    /// 当启用 `forbid_punct_tokens` 时，仍允许生成“空格+标点”的 token，用于吸收 BPE 的优势。
+    ///
+    /// 注意：本实现的 END_TOKEN 是 **词尾标记**（token 以 'Ġ' 结尾表示后面跟着空白），
+    /// 因而 “空格+标点（BPE 里的 `Ġ,` / `Ġ.`）” 在这里对应的是 **“标点 + 'Ġ'”**（例如 `,Ġ`、`.Ġ`、`@-@Ġ`）。
+    ///
+    /// 允许规则（对候选 merge 生效）：
+    /// - 合并后的 token 只包含 **标点/符号**，且 **只包含 1 个 'Ġ' 并且在末尾**。
+    pub allow_space_punct_tokens: bool,
+    /// 当启用 `forbid_punct_tokens` 时，仍允许生成“常见缩写/点分模式”的 token（例如 `U.S.Ġ`, `e.g.Ġ`）。
+    ///
+    /// 允许规则（对候选 merge 生效）：
+    /// - 合并后的 token **只包含 1 个 'Ġ' 并且在末尾**
+    /// - 去掉末尾 'Ġ' 后，只包含 **字母数字** 与 **'.'**
+    /// - 且至少包含 1 个 '.' 与 1 个字母数字
+    pub allow_abbrev_tokens: bool,
+    /// 当启用 `forbid_punct_tokens` 时，仍允许生成“连字符/负号模式”的 token（例如 `well-knownĠ`）。
+    ///
+    /// 允许规则（对候选 merge 生效）：
+    /// - 合并后的 token **只包含 1 个 'Ġ' 并且在末尾**
+    /// - 去掉末尾 'Ġ' 后，只包含 **字母数字** 与 **'-'**
+    /// - 且至少包含 1 个 '-' 与 1 个字母数字，并且首尾为字母数字（避免 `-foo` / `bar-` 这类噪声）
+    pub allow_hyphen_tokens: bool,
+    /// 当启用 `forbid_punct_tokens` 时，仍允许生成“词尾标点”token（例如 `word,Ġ`, `word.Ġ`, `word)Ġ`）。
+    ///
+    /// 允许规则（对候选 merge 生效）：
+    /// - token **只包含 1 个 'Ġ' 且在末尾**（单词级）
+    /// - 去掉末尾 'Ġ' 后：前缀为字母数字，末尾为 1~3 个“允许的标点符号”
+    /// - 标点仅允许出现在末尾（避免把标点塞进词干里）
+    pub allow_word_final_punct_tokens: bool,
+    /// 当启用 `forbid_punct_tokens` 时，仍允许生成“撇号缩写/所有格”token（例如 `don'tĠ`, `John'sĠ`, `I'mĠ`）。
+    ///
+    /// 允许规则（对候选 merge 生效）：
+    /// - token **只包含 1 个 'Ġ' 且在末尾**（单词级）
+    /// - 去掉末尾 'Ġ' 后：只包含字母数字与 `'`（撇号），并且至少包含 1 个字母数字与 1 个 `'`
+    pub allow_apostrophe_tokens: bool,
+    /// 当启用 `forbid_punct_tokens` 时，仍允许生成“跨词 + 标点混合”的 token（SuperBPE 的核心优势之一）。
+    ///
+    /// 这里的“跨词”以 token 中包含多个 END_TOKEN('Ġ') 为准（即 token 覆盖多个词尾）。
+    /// 为避免失控地生成噪声 token，我们做**强约束**：
+    /// - token 必须以 'Ġ' 结尾（完整跨词）
+    /// - 以 'Ġ' 为分隔，每个 segment（不含 'Ġ'）必须满足下列之一：
+    ///   - 纯字母数字（word）
+    ///   - 纯标点（punct-only，长度受限）
+    ///   - 缩写点分（abbrev，比如 U.S.）
+    ///   - 连字符（hyphen，比如 well-known）
+    ///   - 撇号（apostrophe，比如 don't）
+    ///   - 词尾标点（word-final punct，比如 time, / word)）
+    ///
+    /// 目的：吸收 SuperBPE 的低 TPC 优势（例如 `,ĠtheĠ`, `.ĠAtĠtheĠ` 这类模式），同时尽量维持 token 可预测性。
+    pub allow_cross_word_punct_word_mix_tokens: bool,
+    /// SuperBPE 风格：控制“跨词(superword) token”的生成时机。
+    ///
+    /// 语义：当 `cross_word_start_vocab>0` 时，只有当当前词表大小（含 special tokens）达到该阈值后，
+    /// 才允许生成 **包含 >=2 个 'Ġ'** 的 token（即跨越多个词的短语 token）。
+    ///
+    /// 直觉：先把预算用在“词内 subword + 高频标点模式”，等词表接近目标规模后再引入 superwords，
+    /// 避免过早生成大量长尾短语 token 导致 token 分布变平、模型更难学。
+    pub cross_word_start_vocab: usize,
+    /// 限制单个 token 内最多包含多少个词（用 'Ġ' 的计数近似，即 token 中 'Ġ' 的个数）。
+    ///
+    /// - 0 表示不限制
+    /// - 1 表示只允许单词级 token（含词尾 'Ġ'）与词内 subword（无 'Ġ'），禁止任何多词短语 token
+    /// - 2/3/... 允许最多 2/3/... 词的短语 token
+    pub max_token_words: usize,
+    /// 禁止生成“跨词但不完整”的 token：即 token **包含 END_TOKEN('Ġ') 但不是以 END_TOKEN 结尾**。
+    ///
+    /// 直觉：这种 token 会跨越词边界却在末尾切进词内部（例如 `000Ġkg`, `'sĠdeath`），
+    /// 往往更难预测，容易伤 bpc。
+    pub forbid_incomplete_cross_word: bool,
     pub recompute_each_step: bool, // 测试/调试用，全量重算统计
     /// 是否使用候选堆（BinaryHeap）加速 argmax 选择。
     ///
@@ -324,6 +408,18 @@ impl Default for TokenizerConfig {
             num_merges: 20000,
             n_values: vec![2, 3, 4, 5, 6],
             aim_token_num: 15_000,
+            max_token_chars: 0,
+            forbid_punct_word_mix: false,
+            forbid_punct_tokens: false,
+            allow_space_punct_tokens: false,
+            allow_abbrev_tokens: false,
+            allow_hyphen_tokens: false,
+            allow_word_final_punct_tokens: false,
+            allow_apostrophe_tokens: false,
+            allow_cross_word_punct_word_mix_tokens: false,
+            cross_word_start_vocab: 0,
+            max_token_words: 0,
+            forbid_incomplete_cross_word: false,
             recompute_each_step: false,
             use_heap: false,
             num_workers: 0,
@@ -363,6 +459,9 @@ struct SeqEntry {
 struct Interner {
     token_to_id: HashMap<String, u32, RandomState>,
     id_to_token: Vec<String>,
+    id_to_chars: Vec<u32>,
+    id_to_flags: Vec<u8>,
+    id_to_end_count: Vec<u8>,
 }
 
 impl Interner {
@@ -370,7 +469,58 @@ impl Interner {
         Self {
             token_to_id: HashMap::with_hasher(RandomState::new()),
             id_to_token: Vec::new(),
+            id_to_chars: Vec::new(),
+            id_to_flags: Vec::new(),
+            id_to_end_count: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn token_flags(s: &str) -> u8 {
+        // Flags used to cheaply filter candidate merges.
+        // Goal: detect tokens that contain punctuation/symbols, and tokens that mix
+        // "word chars" with punctuation/symbols.
+        //
+        // - word char: Unicode alnum
+        // - punct: any non-alphanumeric char (excluding END_TOKEN 'Ġ')
+        //
+        // Note: END_TOKEN ('Ġ') is treated as neutral for WORD/PUNCT, but we still record its presence.
+        const WORD: u8 = 1;
+        const PUNCT: u8 = 2;
+        const HAS_END: u8 = 4;
+        const END_AT_END: u8 = 8;
+        let mut f: u8 = 0;
+        let mut has_end = false;
+        for ch in s.chars() {
+            if ch == 'Ġ' {
+                has_end = true;
+                continue;
+            }
+            if ch.is_alphanumeric() {
+                f |= WORD;
+                continue;
+            }
+            // Any non-alnum (punctuation/symbol) counts as PUNCT for our merge filters.
+            f |= PUNCT;
+        }
+        if has_end {
+            f |= HAS_END;
+        }
+        if s.ends_with('Ġ') {
+            f |= END_AT_END;
+        }
+        f
+    }
+
+    #[inline]
+    fn token_end_count(s: &str) -> u8 {
+        let mut n: u8 = 0;
+        for ch in s.chars() {
+            if ch == 'Ġ' {
+                n = n.saturating_add(1);
+            }
+        }
+        n
     }
 
     fn intern(&mut self, s: &str) -> u32 {
@@ -380,12 +530,579 @@ impl Interner {
         let id = self.id_to_token.len() as u32;
         self.id_to_token.push(s.to_string());
         self.token_to_id.insert(s.to_string(), id);
+        self.id_to_chars.push(s.chars().count() as u32);
+        self.id_to_flags.push(Self::token_flags(s));
+        self.id_to_end_count.push(Self::token_end_count(s));
         id
     }
 
     fn get(&self, id: u32) -> &str {
         &self.id_to_token[id as usize]
     }
+
+    #[inline]
+    fn chars_len(&self, id: u32) -> usize {
+        self.id_to_chars[id as usize] as usize
+    }
+
+    fn rebuild_char_lens(&mut self) {
+        self.id_to_chars = self.id_to_token.iter().map(|s| s.chars().count() as u32).collect();
+    }
+
+    fn rebuild_flags(&mut self) {
+        self.id_to_flags = self.id_to_token.iter().map(|s| Self::token_flags(s)).collect();
+    }
+
+    fn rebuild_end_counts(&mut self) {
+        self.id_to_end_count = self.id_to_token.iter().map(|s| Self::token_end_count(s)).collect();
+    }
+}
+
+#[inline]
+fn ngram_char_len(ng: &Ngram, id_to_chars: &[u32]) -> usize {
+    let mut sum: usize = 0;
+    for &id in ng.iter() {
+        sum += id_to_chars[id as usize] as usize;
+    }
+    sum
+}
+
+#[inline]
+fn ngram_flags_or(ng: &Ngram, id_to_flags: &[u8]) -> u8 {
+    let mut f: u8 = 0;
+    for &id in ng.iter() {
+        f |= id_to_flags[id as usize];
+    }
+    f
+}
+
+#[inline]
+fn ngram_end_count(ng: &Ngram, id_to_end_count: &[u8]) -> u8 {
+    let mut sum: u8 = 0;
+    for &id in ng.iter() {
+        sum = sum.saturating_add(id_to_end_count[id as usize]);
+    }
+    sum
+}
+
+#[inline]
+fn ngram_cross_word_blocked(
+    ng: &Ngram,
+    cfg: &TokenizerConfig,
+    id_to_end_count: &[u8],
+    vocab_size_with_specials: usize,
+) -> bool {
+    let words = ngram_end_count(ng, id_to_end_count) as usize;
+    if cfg.max_token_words > 0 && words > cfg.max_token_words {
+        return true;
+    }
+    if cfg.cross_word_start_vocab > 0 && words >= 2 && vocab_size_with_specials < cfg.cross_word_start_vocab {
+        return true;
+    }
+    false
+}
+
+#[inline]
+fn ngram_mixes_punct_and_word(ng: &Ngram, id_to_flags: &[u8]) -> bool {
+    // Must match Interner::token_flags bits.
+    const WORD: u8 = 1;
+    const PUNCT: u8 = 2;
+    let f = ngram_flags_or(ng, id_to_flags);
+    (f & WORD) != 0 && (f & PUNCT) != 0
+}
+
+#[inline]
+fn ngram_has_hard_punct(ng: &Ngram, id_to_flags: &[u8]) -> bool {
+    // Must match Interner::token_flags bits.
+    const PUNCT: u8 = 2;
+    let f = ngram_flags_or(ng, id_to_flags);
+    (f & PUNCT) != 0
+}
+
+#[inline]
+fn ngram_has_single_trailing_end(ng: &Ngram, id_to_flags: &[u8], id_to_token: &[String]) -> bool {
+    // Exactly one 'Ġ' in the merged token, and it must be the last character.
+    //
+    // We approximate this cheaply by enforcing:
+    // - only the last part may contain END_TOKEN
+    // - the last part must end with END_TOKEN and contain it exactly once
+    const HAS_END: u8 = 4;
+    const END_AT_END: u8 = 8;
+    if ng.is_empty() {
+        return false;
+    }
+    let last = *ng.last().unwrap();
+    if (id_to_flags[last as usize] & END_AT_END) == 0 {
+        return false;
+    }
+    // no END in prefix parts
+    if ng.len() >= 2 {
+        for &id in &ng[..ng.len() - 1] {
+            if (id_to_flags[id as usize] & HAS_END) != 0 {
+                return false;
+            }
+        }
+    }
+    let s_last = &id_to_token[last as usize];
+    if !s_last.ends_with('Ġ') {
+        return false;
+    }
+    // avoid allowing cross-word tokens like "theĠofĠ"
+    s_last.chars().filter(|&c| c == 'Ġ').count() == 1
+}
+
+#[inline]
+fn ngram_is_allowed_space_punct_token(ng: &Ngram, id_to_flags: &[u8], id_to_token: &[String]) -> bool {
+    // Allow punctuation-only tokens that end with a single trailing END_TOKEN (e.g. ",Ġ", ".Ġ", "@-@Ġ").
+    //
+    // Criteria:
+    // - merged token has PUNCT and has NO WORD chars
+    // - merged token has exactly one trailing END_TOKEN
+    const WORD: u8 = 1;
+    const PUNCT: u8 = 2;
+    let f = ngram_flags_or(ng, id_to_flags);
+    if (f & PUNCT) == 0 {
+        return false;
+    }
+    if (f & WORD) != 0 {
+        return false;
+    }
+    ngram_has_single_trailing_end(ng, id_to_flags, id_to_token)
+}
+
+#[inline]
+fn ngram_is_allowed_abbrev_token(ng: &Ngram, id_to_flags: &[u8], id_to_token: &[String]) -> bool {
+    // Allow abbreviation/dot patterns like "U.S.Ġ", "e.g.Ġ", "etc.Ġ".
+    //
+    // Restrict to single-word tokens (exactly one trailing END_TOKEN) to avoid merging across words.
+    if !ngram_has_single_trailing_end(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    // Scan all characters excluding the last 'Ġ', without allocating the merged string.
+    let mut has_dot = false;
+    let mut has_alnum = false;
+    let mut len_chars = 0usize;
+    for (idx, &id) in ng.iter().enumerate() {
+        let s = &id_to_token[id as usize];
+        if idx + 1 == ng.len() {
+            // last token: strip trailing 'Ġ'
+            let core = match s.strip_suffix('Ġ') {
+                Some(c) => c,
+                None => return false,
+            };
+            for ch in core.chars() {
+                len_chars += 1;
+                if len_chars > 24 {
+                    return false;
+                }
+                if ch.is_alphanumeric() {
+                    has_alnum = true;
+                } else if ch == '.' {
+                    has_dot = true;
+                } else {
+                    return false;
+                }
+            }
+        } else {
+            // prefix tokens must not contain 'Ġ' (already ensured by ngram_has_single_trailing_end), but
+            // we still enforce allowed char set here.
+            for ch in s.chars() {
+                if ch == 'Ġ' {
+                    return false;
+                }
+                len_chars += 1;
+                if len_chars > 24 {
+                    return false;
+                }
+                if ch.is_alphanumeric() {
+                    has_alnum = true;
+                } else if ch == '.' {
+                    has_dot = true;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    has_dot && has_alnum
+}
+
+#[inline]
+fn ngram_is_allowed_hyphen_token(ng: &Ngram, id_to_flags: &[u8], id_to_token: &[String]) -> bool {
+    // Allow hyphenated-word patterns like "well-knownĠ".
+    //
+    // Restrict to single-word tokens (exactly one trailing END_TOKEN) to avoid merging across words.
+    if !ngram_has_single_trailing_end(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    let mut has_hyphen = false;
+    let mut has_alnum = false;
+    let mut len_chars = 0usize;
+    let mut first: Option<char> = None;
+    let mut last: Option<char> = None;
+    for (idx, &id) in ng.iter().enumerate() {
+        let s = &id_to_token[id as usize];
+        if idx + 1 == ng.len() {
+            let core = match s.strip_suffix('Ġ') {
+                Some(c) => c,
+                None => return false,
+            };
+            for ch in core.chars() {
+                if ch == 'Ġ' {
+                    return false;
+                }
+                len_chars += 1;
+                if len_chars > 32 {
+                    return false;
+                }
+                if first.is_none() {
+                    first = Some(ch);
+                }
+                last = Some(ch);
+                if ch.is_alphanumeric() {
+                    has_alnum = true;
+                } else if ch == '-' {
+                    has_hyphen = true;
+                } else {
+                    return false;
+                }
+            }
+        } else {
+            for ch in s.chars() {
+            if ch == 'Ġ' {
+                return false;
+            }
+            len_chars += 1;
+            if len_chars > 32 {
+                return false;
+            }
+            if first.is_none() {
+                first = Some(ch);
+            }
+            last = Some(ch);
+            if ch.is_alphanumeric() {
+                has_alnum = true;
+            } else if ch == '-' {
+                has_hyphen = true;
+            } else {
+                return false;
+            }
+        }
+        }
+    }
+    if !has_hyphen || !has_alnum {
+        return false;
+    }
+    // ensure token does not start/end with '-'
+    match (first, last) {
+        (Some(f), Some(l)) if f.is_alphanumeric() && l.is_alphanumeric() => true,
+        _ => false,
+    }
+}
+
+#[inline]
+fn ngram_is_allowed_apostrophe_token(ng: &Ngram, id_to_flags: &[u8], id_to_token: &[String]) -> bool {
+    // Allow single-word tokens containing apostrophe, e.g. "don'tĠ", "John'sĠ", "I'mĠ".
+    if !ngram_has_single_trailing_end(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    let mut has_apos = false;
+    let mut has_alnum = false;
+    let mut len_chars = 0usize;
+    for (idx, &id) in ng.iter().enumerate() {
+        let s = &id_to_token[id as usize];
+        let core = if idx + 1 == ng.len() {
+            match s.strip_suffix('Ġ') {
+                Some(c) => c,
+                None => return false,
+            }
+        } else {
+            s.as_str()
+        };
+        for ch in core.chars() {
+            if ch == 'Ġ' {
+                return false;
+            }
+            len_chars += 1;
+            if len_chars > 32 {
+                return false;
+            }
+            if ch.is_alphanumeric() {
+                has_alnum = true;
+                continue;
+            }
+            if ch == '\'' {
+                has_apos = true;
+                continue;
+            }
+            return false;
+        }
+    }
+    has_apos && has_alnum
+}
+
+#[inline]
+fn is_word_final_punct_allowed(ch: char) -> bool {
+    matches!(ch, ',' | '.' | '!' | '?' | ':' | ';' | ')' | ']' | '}' | '"' | '\'')
+}
+
+#[inline]
+fn segment_is_punct_only(seg: &[char]) -> bool {
+    if seg.is_empty() {
+        return false;
+    }
+    if seg.len() > 6 {
+        // 防止出现超长标点串（通常会让 token 非常稀疏且难学）
+        return false;
+    }
+    seg.iter().all(|c| !c.is_alphanumeric())
+}
+
+#[inline]
+fn segment_is_alnum_only(seg: &[char]) -> bool {
+    !seg.is_empty() && seg.iter().all(|c| c.is_alphanumeric())
+}
+
+#[inline]
+fn segment_is_abbrev(seg: &[char]) -> bool {
+    if seg.is_empty() || seg.len() > 24 {
+        return false;
+    }
+    let mut has_dot = false;
+    let mut has_alnum = false;
+    for &ch in seg {
+        if ch.is_alphanumeric() {
+            has_alnum = true;
+        } else if ch == '.' {
+            has_dot = true;
+        } else {
+            return false;
+        }
+    }
+    has_dot && has_alnum
+}
+
+#[inline]
+fn segment_is_hyphen(seg: &[char]) -> bool {
+    if seg.is_empty() || seg.len() > 32 {
+        return false;
+    }
+    if !seg[0].is_alphanumeric() || !seg[seg.len() - 1].is_alphanumeric() {
+        return false;
+    }
+    let mut has_hyphen = false;
+    let mut has_alnum = false;
+    for &ch in seg {
+        if ch.is_alphanumeric() {
+            has_alnum = true;
+        } else if ch == '-' {
+            has_hyphen = true;
+        } else {
+            return false;
+        }
+    }
+    has_hyphen && has_alnum
+}
+
+#[inline]
+fn segment_is_apostrophe(seg: &[char]) -> bool {
+    if seg.is_empty() || seg.len() > 32 {
+        return false;
+    }
+    let mut has_apos = false;
+    let mut has_alnum = false;
+    for &ch in seg {
+        if ch.is_alphanumeric() {
+            has_alnum = true;
+        } else if ch == '\'' {
+            has_apos = true;
+        } else {
+            return false;
+        }
+    }
+    has_apos && has_alnum
+}
+
+#[inline]
+fn segment_is_word_final_punct(seg: &[char]) -> bool {
+    if seg.is_empty() || seg.len() > 48 {
+        return false;
+    }
+    // count trailing punct
+    let mut punct_len = 0usize;
+    for &ch in seg.iter().rev() {
+        if is_word_final_punct_allowed(ch) {
+            punct_len += 1;
+            if punct_len > 3 {
+                return false;
+            }
+        } else {
+            break;
+        }
+    }
+    if punct_len == 0 {
+        return false;
+    }
+    let word_len = seg.len() - punct_len;
+    if word_len == 0 {
+        return false;
+    }
+    seg[..word_len].iter().all(|c| c.is_alphanumeric())
+}
+
+#[inline]
+fn segment_allowed_for_cross_word_mix(seg: &[char]) -> bool {
+    segment_is_alnum_only(seg)
+        || segment_is_punct_only(seg)
+        || segment_is_abbrev(seg)
+        || segment_is_hyphen(seg)
+        || segment_is_apostrophe(seg)
+        || segment_is_word_final_punct(seg)
+}
+
+#[inline]
+fn ngram_is_allowed_cross_word_punct_word_mix_token(ng: &Ngram, id_to_token: &[String]) -> bool {
+    // Parse merged token by scanning characters and splitting on 'Ġ'.
+    // Requirements:
+    // - ends with 'Ġ' (so we end on a boundary)
+    // - has at least 2 segments (i.e., cross-word)
+    // - each segment conforms to allowed patterns
+    use smallvec::SmallVec;
+
+    // NOTE: smallvec::Array is only implemented for a bounded set of N; keep this <=32.
+    // We still cap segment length at 48 chars; if it exceeds 32, SmallVec will spill to heap.
+    let mut seg: SmallVec<[char; 32]> = SmallVec::new();
+    let mut seg_cnt: usize = 0;
+    for &id in ng.iter() {
+        for ch in id_to_token[id as usize].chars() {
+            if ch == 'Ġ' {
+                if seg.is_empty() {
+                    return false;
+                }
+                if !segment_allowed_for_cross_word_mix(seg.as_slice()) {
+                    return false;
+                }
+                seg_cnt += 1;
+                seg.clear();
+            } else {
+                if seg.len() >= 48 {
+                    return false;
+                }
+                seg.push(ch);
+            }
+        }
+    }
+    // must end with 'Ġ'
+    if !seg.is_empty() {
+        return false;
+    }
+    seg_cnt >= 2
+}
+
+#[inline]
+fn ngram_is_allowed_word_final_punct_token(ng: &Ngram, id_to_flags: &[u8], id_to_token: &[String]) -> bool {
+    // Allow single-word tokens with trailing punctuation, e.g. "word,Ġ", "word)Ġ", "word.\"Ġ".
+    if !ngram_has_single_trailing_end(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    // Build a small buffer of chars (bounded) to check that punctuation only appears at end.
+    let mut chars: Vec<char> = Vec::with_capacity(32);
+    for (idx, &id) in ng.iter().enumerate() {
+        let s = &id_to_token[id as usize];
+        let core = if idx + 1 == ng.len() {
+            match s.strip_suffix('Ġ') {
+                Some(c) => c,
+                None => return false,
+            }
+        } else {
+            s.as_str()
+        };
+        for ch in core.chars() {
+            if ch == 'Ġ' {
+                return false;
+            }
+            if chars.len() >= 32 {
+                return false;
+            }
+            chars.push(ch);
+        }
+    }
+    if chars.is_empty() {
+        return false;
+    }
+    // Find first trailing-punct boundary (scan from end)
+    let mut punct_len = 0usize;
+    for &ch in chars.iter().rev() {
+        if is_word_final_punct_allowed(ch) {
+            punct_len += 1;
+            if punct_len > 3 {
+                return false;
+            }
+        } else {
+            break;
+        }
+    }
+    if punct_len == 0 {
+        return false;
+    }
+    let word_len = chars.len() - punct_len;
+    if word_len == 0 {
+        return false;
+    }
+    // Prefix must be alnum-only
+    if !chars[..word_len].iter().all(|c| c.is_alphanumeric()) {
+        return false;
+    }
+    true
+}
+
+#[inline]
+fn ngram_has_forbidden_punct(ng: &Ngram, cfg: &TokenizerConfig, id_to_flags: &[u8], id_to_token: &[String]) -> bool {
+    // Training-time filter for punctuation-bearing candidates, with optional allow-list rules.
+    if !cfg.forbid_punct_tokens {
+        return false;
+    }
+    if !ngram_has_hard_punct(ng, id_to_flags) {
+        return false;
+    }
+    if cfg.allow_space_punct_tokens && ngram_is_allowed_space_punct_token(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    if cfg.allow_abbrev_tokens && ngram_is_allowed_abbrev_token(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    if cfg.allow_hyphen_tokens && ngram_is_allowed_hyphen_token(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    if cfg.allow_apostrophe_tokens && ngram_is_allowed_apostrophe_token(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    if cfg.allow_word_final_punct_tokens && ngram_is_allowed_word_final_punct_token(ng, id_to_flags, id_to_token) {
+        return false;
+    }
+    if cfg.allow_cross_word_punct_word_mix_tokens && ngram_is_allowed_cross_word_punct_word_mix_token(ng, id_to_token) {
+        return false;
+    }
+    true
+}
+
+#[inline]
+fn ngram_is_incomplete_cross_word(ng: &Ngram, id_to_flags: &[u8]) -> bool {
+    // Incomplete cross-word token: contains END_TOKEN somewhere, but DOES NOT end with END_TOKEN.
+    // This can be detected purely from flags:
+    // - n-gram OR-flags contains HAS_END
+    // - last token does NOT have END_AT_END
+    const HAS_END: u8 = 4;
+    const END_AT_END: u8 = 8;
+    if ng.is_empty() {
+        return false;
+    }
+    let f = ngram_flags_or(ng, id_to_flags);
+    if (f & HAS_END) == 0 {
+        return false;
+    }
+    let last = *ng.last().unwrap();
+    (id_to_flags[last as usize] & END_AT_END) == 0
 }
 
 // ===== 应用分词：Trie + DP（全局最少 token 数）=====
@@ -505,6 +1222,82 @@ impl TokenTrie {
                 };
                 node = child;
                 if let Some(tok_id) = self.nodes[node].term_id {
+                    let cand = 1u32.saturating_add(dp[j + 1]);
+                    let better = if cand < dp[i] {
+                        true
+                    } else if cand == dp[i] {
+                        match back[i] {
+                            Some((best_j, _)) => (j + 1 - i) > (best_j - i),
+                            None => true,
+                        }
+                    } else {
+                        false
+                    };
+                    if better {
+                        dp[i] = cand;
+                        back[i] = Some((j + 1, tok_id));
+                    }
+                }
+            }
+
+            if back[i].is_none() {
+                dp[i] = 1u32.saturating_add(dp[i + 1]);
+                back[i] = Some((i + 1, unk_id));
+            }
+        }
+
+        let mut out: Vec<u32> = Vec::with_capacity(dp[0] as usize);
+        let mut i = 0usize;
+        while i < n {
+            let Some((j, id)) = back[i] else {
+                out.push(unk_id);
+                i += 1;
+                continue;
+            };
+            out.push(id);
+            i = j;
+        }
+        out
+    }
+
+    /// DP：最少 token 数 + 兜底 unk，并支持“某些 token 必须从词首开始”这一约束。
+    ///
+    /// 约束由 `require_word_start[token_id]` 指定：
+    /// - 0：无限制
+    /// - 1：仅允许在词首位置使用（i==0 或 s[i-1]==end_char）
+    ///
+    /// 用途：允许“跨词 token（包含多个 END_TOKEN）”只在词首使用，从而避免它在词内起始导致
+    /// “不完整跨词 token”（例如把 'Oxford' 拆成 'fordĠCambridgeĠ'）。
+    fn dp_min_ids_allow_unk_require_word_start(
+        &self,
+        s: &[char],
+        unk_id: u32,
+        require_word_start: &[u8],
+        end_char: char,
+    ) -> Vec<u32> {
+        let n = s.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let inf = u32::MAX / 8;
+        let mut dp: Vec<u32> = vec![inf; n + 1];
+        let mut back: Vec<Option<(usize, u32)>> = vec![None; n + 1];
+        dp[n] = 0;
+
+        for i in (0..n).rev() {
+            let at_word_start = i == 0 || s[i - 1] == end_char;
+            let mut node = 0usize;
+            for j in i..n {
+                let Some(&child) = self.nodes[node].next.get(&s[j]) else {
+                    break;
+                };
+                node = child;
+                if let Some(tok_id) = self.nodes[node].term_id {
+                    let idx = tok_id as usize;
+                    if idx < require_word_start.len() && require_word_start[idx] != 0 && !at_word_start {
+                        continue;
+                    }
                     let cand = 1u32.saturating_add(dp[j + 1]);
                     let better = if cand < dp[i] {
                         true
@@ -691,10 +1484,24 @@ impl LengthTokenizer {
     /// 重建候选堆（仅保留 freq>1 的项）
     fn rebuild_heap(&mut self) {
         self.heap.clear();
+        let max_chars = self.cfg.max_token_chars;
+        let id_to_chars = &self.interner.id_to_chars;
+        let id_to_flags = &self.interner.id_to_flags;
+        let id_to_token = &self.interner.id_to_token;
+        let id_to_end_count = &self.interner.id_to_end_count;
+        let vocab_sz = self.vocab_size_with_specials();
+        let forbid_mix = self.cfg.forbid_punct_word_mix;
+        let forbid_punct = self.cfg.forbid_punct_tokens;
+        let forbid_incomplete = self.cfg.forbid_incomplete_cross_word;
         self.heap.extend(
             self.global_stats
                 .iter()
                 .filter(|(_, st)| st.freq > 1)
+                .filter(|(ng, _)| max_chars == 0 || ngram_char_len(ng, id_to_chars) <= max_chars)
+                .filter(|(ng, _)| !forbid_mix || !ngram_mixes_punct_and_word(ng, id_to_flags))
+                .filter(|(ng, _)| !forbid_punct || !ngram_has_forbidden_punct(ng, &self.cfg, id_to_flags, id_to_token))
+                .filter(|(ng, _)| !ngram_cross_word_blocked(ng, &self.cfg, id_to_end_count, vocab_sz))
+                .filter(|(ng, _)| !forbid_incomplete || !ngram_is_incomplete_cross_word(ng, id_to_flags))
                 .map(|(ng, st)| Candidate {
                     score: st.score,
                     len: ng.len(),
@@ -705,6 +1512,25 @@ impl LengthTokenizer {
 
     /// 将某个 n-gram 更新入堆（若 freq>1）
     fn push_candidate(&mut self, ng: &Ngram) {
+        let max_chars = self.cfg.max_token_chars;
+        if max_chars > 0 && ngram_char_len(ng, &self.interner.id_to_chars) > max_chars {
+            return;
+        }
+        if self.cfg.forbid_punct_word_mix && ngram_mixes_punct_and_word(ng, &self.interner.id_to_flags) {
+            return;
+        }
+        if self.cfg.forbid_punct_tokens
+            && ngram_has_forbidden_punct(ng, &self.cfg, &self.interner.id_to_flags, &self.interner.id_to_token)
+        {
+            return;
+        }
+        let vocab_sz = self.vocab_size_with_specials();
+        if ngram_cross_word_blocked(ng, &self.cfg, &self.interner.id_to_end_count, vocab_sz) {
+            return;
+        }
+        if self.cfg.forbid_incomplete_cross_word && ngram_is_incomplete_cross_word(ng, &self.interner.id_to_flags) {
+            return;
+        }
         if let Some(st) = self.global_stats.get(ng) {
             if st.freq > 1 {
                 self.heap.push(Candidate {
@@ -718,6 +1544,15 @@ impl LengthTokenizer {
 
     /// 从堆中弹出当前有效的全局最优（懒惰删除过期项）
     fn pop_best_from_heap(&mut self) -> Option<(Ngram, Stat)> {
+        let max_chars = self.cfg.max_token_chars;
+        let id_to_chars = &self.interner.id_to_chars;
+        let id_to_flags = &self.interner.id_to_flags;
+        let id_to_token = &self.interner.id_to_token;
+        let id_to_end_count = &self.interner.id_to_end_count;
+        let vocab_sz = self.vocab_size_with_specials();
+        let forbid_mix = self.cfg.forbid_punct_word_mix;
+        let forbid_punct = self.cfg.forbid_punct_tokens;
+        let forbid_incomplete = self.cfg.forbid_incomplete_cross_word;
         while let Some(cand) = self.heap.pop() {
             if let Some(st) = self.global_stats.get(&cand.ngram) {
                 if st.freq <= 1 {
@@ -732,6 +1567,21 @@ impl LengthTokenizer {
                     });
                     continue;
                 }
+                if max_chars > 0 && ngram_char_len(&cand.ngram, id_to_chars) > max_chars {
+                    continue;
+                }
+                if forbid_mix && ngram_mixes_punct_and_word(&cand.ngram, id_to_flags) {
+                    continue;
+                }
+                if forbid_punct && ngram_has_forbidden_punct(&cand.ngram, &self.cfg, id_to_flags, id_to_token) {
+                    continue;
+                }
+                if ngram_cross_word_blocked(&cand.ngram, &self.cfg, id_to_end_count, vocab_sz) {
+                    continue;
+                }
+                if forbid_incomplete && ngram_is_incomplete_cross_word(&cand.ngram, id_to_flags) {
+                    continue;
+                }
                 return Some((cand.ngram, st.clone()));
             }
         }
@@ -740,10 +1590,38 @@ impl LengthTokenizer {
 
     /// 查看当前有效的全局最优分数（不弹出有效项；会清理堆顶过期项）
     fn peek_best_score(&mut self) -> Option<u64> {
+        let vocab_sz = self.vocab_size_with_specials();
         loop {
             let cand = self.heap.peek()?.clone();
             match self.global_stats.get(&cand.ngram) {
                 Some(st) if st.freq > 1 && st.score == cand.score && cand.len == cand.ngram.len() => {
+                    if self.cfg.forbid_punct_word_mix
+                        && ngram_mixes_punct_and_word(&cand.ngram, &self.interner.id_to_flags)
+                    {
+                        let _ = self.heap.pop();
+                        continue;
+                    }
+                    if self.cfg.forbid_punct_tokens
+                        && ngram_has_forbidden_punct(
+                            &cand.ngram,
+                            &self.cfg,
+                            &self.interner.id_to_flags,
+                            &self.interner.id_to_token,
+                        )
+                    {
+                        let _ = self.heap.pop();
+                        continue;
+                    }
+                    if ngram_cross_word_blocked(&cand.ngram, &self.cfg, &self.interner.id_to_end_count, vocab_sz) {
+                        let _ = self.heap.pop();
+                        continue;
+                    }
+                    if self.cfg.forbid_incomplete_cross_word
+                        && ngram_is_incomplete_cross_word(&cand.ngram, &self.interner.id_to_flags)
+                    {
+                        let _ = self.heap.pop();
+                        continue;
+                    }
                     return Some(st.score);
                 }
                 Some(st) if st.freq > 1 => {
@@ -1170,6 +2048,9 @@ impl LengthTokenizer {
         }
         self.interner.id_to_token = tokens_vec;
         self.interner.token_to_id = token_to_id;
+        self.interner.rebuild_char_lens();
+        self.interner.rebuild_flags();
+        self.interner.rebuild_end_counts();
         log_line(
             "build_vocab_mp",
             format!(
@@ -1339,6 +2220,39 @@ impl LengthTokenizer {
                     if st.freq <= 1 {
                         continue;
                     }
+                    if self.cfg.max_token_chars > 0
+                        && ngram_char_len(ng, &self.interner.id_to_chars) > self.cfg.max_token_chars
+                    {
+                        continue;
+                    }
+                    if self.cfg.forbid_punct_word_mix
+                        && ngram_mixes_punct_and_word(ng, &self.interner.id_to_flags)
+                    {
+                        continue;
+                    }
+                    if self.cfg.forbid_punct_tokens
+                        && ngram_has_forbidden_punct(
+                            ng,
+                            &self.cfg,
+                            &self.interner.id_to_flags,
+                            &self.interner.id_to_token,
+                        )
+                    {
+                        continue;
+                    }
+                    if ngram_cross_word_blocked(
+                        ng,
+                        &self.cfg,
+                        &self.interner.id_to_end_count,
+                        self.vocab_size_with_specials(),
+                    ) {
+                        continue;
+                    }
+                    if self.cfg.forbid_incomplete_cross_word
+                        && ngram_is_incomplete_cross_word(ng, &self.interner.id_to_flags)
+                    {
+                        continue;
+                    }
                     // 调试：关注 wh / gh 频次
                     #[cfg(debug_assertions)]
                     {
@@ -1393,6 +2307,16 @@ impl LengthTokenizer {
                 } else {
                     // 低内存模式：扫描 global_stats 选择 best（精确 argmax；通常瓶颈在 apply）
                     let stats_view = &self.global_stats;
+                    let max_chars = self.cfg.max_token_chars;
+                    let id_to_chars = &self.interner.id_to_chars;
+                    let id_to_flags = &self.interner.id_to_flags;
+                    let id_to_token = &self.interner.id_to_token;
+                    let id_to_end_count = &self.interner.id_to_end_count;
+                    let forbid_mix = self.cfg.forbid_punct_word_mix;
+                    let forbid_punct = self.cfg.forbid_punct_tokens;
+                    let forbid_incomplete = self.cfg.forbid_incomplete_cross_word;
+                    let cfg = &self.cfg;
+                    let vocab_sz = self.vocab_size_with_specials();
                     fn better_ref<'a>(
                         a: (&'a Ngram, &'a Stat),
                         b: (&'a Ngram, &'a Stat),
@@ -1412,7 +2336,14 @@ impl LengthTokenizer {
                     }
                     best = stats_view
                         .par_iter()
-                        .filter(|(_, st)| st.freq > 1)
+                        .filter(|(ng, st)| {
+                            st.freq > 1
+                                && (max_chars == 0 || ngram_char_len(ng, id_to_chars) <= max_chars)
+                                && (!forbid_mix || !ngram_mixes_punct_and_word(ng, id_to_flags))
+                                && (!forbid_punct || !ngram_has_forbidden_punct(ng, cfg, id_to_flags, id_to_token))
+                                && !ngram_cross_word_blocked(ng, cfg, id_to_end_count, vocab_sz)
+                                && (!forbid_incomplete || !ngram_is_incomplete_cross_word(ng, id_to_flags))
+                        })
                         .reduce_with(better_ref)
                         .map(|(ng, st)| (ng.clone(), st.clone()));
                 }
@@ -1696,9 +2627,26 @@ impl LengthTokenizer {
                     }
                 }
                 // hashbrown 开启 rayon 特性后可直接 par_iter，避免 par_bridge 的额外开销
+                let max_chars = self.cfg.max_token_chars;
+                let id_to_chars = &self.interner.id_to_chars;
+                let id_to_flags = &self.interner.id_to_flags;
+                let id_to_token = &self.interner.id_to_token;
+                let id_to_end_count = &self.interner.id_to_end_count;
+                let forbid_mix = self.cfg.forbid_punct_word_mix;
+                let forbid_punct = self.cfg.forbid_punct_tokens;
+                let forbid_incomplete = self.cfg.forbid_incomplete_cross_word;
+                let cfg = &self.cfg;
+                let vocab_sz = self.vocab_size_with_specials();
                 stats_view
                     .par_iter()
-                    .filter(|(_, st)| st.freq > 1)
+                    .filter(|(ng, st)| {
+                        st.freq > 1
+                            && (max_chars == 0 || ngram_char_len(ng, id_to_chars) <= max_chars)
+                            && (!forbid_mix || !ngram_mixes_punct_and_word(ng, id_to_flags))
+                            && (!forbid_punct || !ngram_has_forbidden_punct(ng, cfg, id_to_flags, id_to_token))
+                            && !ngram_cross_word_blocked(ng, cfg, id_to_end_count, vocab_sz)
+                            && (!forbid_incomplete || !ngram_is_incomplete_cross_word(ng, id_to_flags))
+                    })
                     .map(|(ng, st)| (ng, st))
                     .reduce_with(better_ref)
                     .map(|(ng, st)| (ng.clone(), st.clone()))

@@ -78,9 +78,65 @@ struct Args {
     #[arg(long, default_value_t = 15_000)]
     aim_token_num: usize,
 
+    /// 最小 n 值（会生成 [n_min..=n_max]）
+    #[arg(long, default_value_t = 2)]
+    n_min: usize,
+
     /// 最大 n 值（会生成 [2..=n]）
     #[arg(long, default_value_t = 6)]
     n_max: usize,
+
+    /// 限制新生成 token 的最大字符长度（0 表示不限制）
+    #[arg(long, default_value_t = 0)]
+    max_token_chars: usize,
+
+    /// 禁止生成“混合硬标点 + 词元(字母数字)”的新 token（训练阶段过滤候选 merge）
+    #[arg(long, default_value_t = false)]
+    forbid_punct_word_mix: bool,
+
+    /// 禁止生成“包含硬标点（ASCII 标点，排除 ' 与 -）”的新 token（训练阶段过滤候选 merge）
+    #[arg(long, default_value_t = false)]
+    forbid_punct_tokens: bool,
+
+    /// 当启用 --forbid-punct-tokens 时，仍允许生成“空格+标点”token（在本实现中表现为标点+'Ġ'，例如 ",Ġ" ".Ġ" "@-@Ġ"）
+    #[arg(long, default_value_t = false)]
+    allow_space_punct_tokens: bool,
+
+    /// 当启用 --forbid-punct-tokens 时，仍允许生成“缩写/点分模式”token（例如 "U.S.Ġ", "e.g.Ġ"）
+    #[arg(long, default_value_t = false)]
+    allow_abbrev_tokens: bool,
+
+    /// 当启用 --forbid-punct-tokens 时，仍允许生成“连字符模式”token（例如 "well-knownĠ"）
+    #[arg(long, default_value_t = false)]
+    allow_hyphen_tokens: bool,
+
+    /// 当启用 --forbid-punct-tokens 时，仍允许生成“词尾标点”token（例如 "word,Ġ"）
+    #[arg(long, default_value_t = false)]
+    allow_word_final_punct_tokens: bool,
+
+    /// 当启用 --forbid-punct-tokens 时，仍允许生成“撇号缩写/所有格”token（例如 "don'tĠ", "John'sĠ"）
+    #[arg(long, default_value_t = false)]
+    allow_apostrophe_tokens: bool,
+
+    /// 当启用 --forbid-punct-tokens 时，仍允许生成“跨词 + 标点混合”的 token（受控白名单）。
+    ///
+    /// 主要用于吸收 SuperBPE 的低 TPC 优势（例如 ",ĠtheĠ" ".ĠAtĠtheĠ" 等模式）。
+    #[arg(long, default_value_t = false)]
+    allow_cross_word_punct_word_mix_tokens: bool,
+
+    /// SuperBPE 风格：当词表大小达到该阈值后，才允许生成跨词(superword) token（>=2 个 'Ġ'）
+    ///
+    /// 0 表示不限制（从一开始就允许）。
+    #[arg(long, default_value_t = 0)]
+    cross_word_start_vocab: usize,
+
+    /// 限制单个 token 最多包含多少个词（按 'Ġ' 计数）；0 表示不限制
+    #[arg(long, default_value_t = 0)]
+    max_token_words: usize,
+
+    /// 禁止生成“跨词但不完整”的 token：包含 'Ġ' 但不以 'Ġ' 结尾（训练阶段过滤候选 merge）
+    #[arg(long, default_value_t = false)]
+    forbid_incomplete_cross_word: bool,
 
     /// 每步全量重算统计（调试/验证用，默认关闭）
     #[arg(long, default_value_t = false)]
@@ -273,11 +329,29 @@ fn main() -> Result<()> {
         CorpusFormat::Auto => unreachable!("auto resolved in detect_format"),
     };
 
-    let n_values: Vec<usize> = (2..=args.n_max).collect();
+    if args.n_min < 2 {
+        bail!("--n-min must be >= 2");
+    }
+    if args.n_max < args.n_min {
+        bail!("--n-max must be >= --n-min");
+    }
+    let n_values: Vec<usize> = (args.n_min..=args.n_max).collect();
     let cfg = TokenizerConfig {
         num_merges: args.num_merges,
         n_values,
         aim_token_num: args.aim_token_num,
+        max_token_chars: args.max_token_chars,
+        forbid_punct_word_mix: args.forbid_punct_word_mix,
+        forbid_punct_tokens: args.forbid_punct_tokens,
+        allow_space_punct_tokens: args.allow_space_punct_tokens,
+        allow_abbrev_tokens: args.allow_abbrev_tokens,
+        allow_hyphen_tokens: args.allow_hyphen_tokens,
+        allow_word_final_punct_tokens: args.allow_word_final_punct_tokens,
+        allow_apostrophe_tokens: args.allow_apostrophe_tokens,
+        allow_cross_word_punct_word_mix_tokens: args.allow_cross_word_punct_word_mix_tokens,
+        cross_word_start_vocab: args.cross_word_start_vocab,
+        max_token_words: args.max_token_words,
+        forbid_incomplete_cross_word: args.forbid_incomplete_cross_word,
         recompute_each_step: args.recompute_each_step,
         use_heap: args.use_heap,
         num_workers: args.num_workers,
@@ -287,14 +361,27 @@ fn main() -> Result<()> {
     log_main(
         "main",
         format!(
-            "start corpus={:?} format={:?} max_docs={:?} output={:?} merges={} aim_token_num={} n_max={} recompute_each_step={} use_heap={} multi_process={} num_workers={}",
+            "start corpus={:?} format={:?} max_docs={:?} output={:?} merges={} aim_token_num={} n_min={} n_max={} max_token_chars={} forbid_punct_word_mix={} forbid_punct_tokens={} allow_space_punct_tokens={} allow_abbrev_tokens={} allow_hyphen_tokens={} allow_word_final_punct_tokens={} allow_apostrophe_tokens={} allow_cross_word_punct_word_mix_tokens={} cross_word_start_vocab={} max_token_words={} forbid_incomplete_cross_word={} recompute_each_step={} use_heap={} multi_process={} num_workers={}",
             args.corpus,
             fmt,
             max_docs,
             args.output,
             args.num_merges,
             args.aim_token_num,
+            args.n_min,
             args.n_max,
+            args.max_token_chars,
+            args.forbid_punct_word_mix,
+            args.forbid_punct_tokens,
+            args.allow_space_punct_tokens,
+            args.allow_abbrev_tokens,
+            args.allow_hyphen_tokens,
+            args.allow_word_final_punct_tokens,
+            args.allow_apostrophe_tokens,
+            args.allow_cross_word_punct_word_mix_tokens,
+            args.cross_word_start_vocab,
+            args.max_token_words,
+            args.forbid_incomplete_cross_word,
             args.recompute_each_step,
             args.use_heap,
             args.multi_process,

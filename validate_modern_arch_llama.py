@@ -249,13 +249,32 @@ def _eval_model(
     with torch.no_grad():
         for _ in range(int(batches)):
             batch = [_pack_text(lines, int(pack_chars), rng=rng, mode=str(pack_mode)) for _ in range(int(batch_size))]
-            total_chars += sum(len(s) for s in batch)
             enc = _encode_batch(tok, batch, seq_len=int(seq_len), force_eos=bool(force_eos))
+            # IMPORTANT: count chars on the *encoded & truncated* sequence, not on the
+            # pre-truncation packed string. Otherwise, with pack_chars>0 and fixed seq_len,
+            # we would systematically under-estimate TPC (and thus bpc) by including chars
+            # that never enter the model due to token truncation.
+            #
+            # We approximate "chars seen by the model" by decoding the active (non-pad)
+            # token ids back to text and counting its length.
+            seqs: list[list[int]] = []
+            for ids, mask in zip(enc["input_ids"], enc["attention_mask"]):
+                n = int(mask.sum().item())
+                seqs.append(ids[:n].tolist())
+            try:
+                texts = tok.batch_decode(seqs, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            except TypeError:
+                # Some tokenizers may not support clean_up_tokenization_spaces.
+                texts = tok.batch_decode(seqs, skip_special_tokens=True)
+            total_chars += sum(len(t) for t in texts)
+            # Approximate token count that contributes to causal loss: exclude the first token
+            # per sequence (HF causal LM shifts labels by 1). This avoids a tiny systematic
+            # mismatch in TPC.
+            total_tokens += int(enc["attention_mask"].sum().item()) - len(seqs)
             input_ids = enc["input_ids"].to(device, non_blocking=True)
             attention_mask = enc["attention_mask"].to(device, non_blocking=True)
             labels = input_ids.clone()
             labels[labels == int(tok.pad_token_id)] = -100
-            total_tokens += int((labels != -100).sum().item())
 
             if autocast_dtype is None:
                 out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
@@ -269,7 +288,7 @@ def _eval_model(
         model.train()
 
     mean_loss = total / max(1, count)
-    # bpc proxy using observed active tokens/chars on eval batches.
+    # bpc proxy using observed active tokens and decoded (post-truncation) chars on eval batches.
     tpc = (float(total_tokens) / float(total_chars)) if total_chars > 0 else 0.0
     mean_bpc = (mean_loss * tpc / ln2) if tpc > 0 else float("nan")
     return mean_loss, mean_bpc
@@ -316,6 +335,8 @@ def main() -> None:
     ap.add_argument("--tokenizer_dir", type=str, required=True, help="Length-MAX 导出的 HF tokenizer 目录（含 vocab.json 等）")
     ap.add_argument("--corpus_file", type=str, required=True, help="训练用文本：每行一句")
     ap.add_argument("--max_lines", type=int, default=2048, help="最多读取多少行（0 表示不限制）")
+    ap.add_argument("--eval_corpus_file", type=str, default="", help="若非空，则评测时使用该语料文件（建议 validation/test）")
+    ap.add_argument("--eval_max_lines", type=int, default=0, help="eval 语料最多读取多少行（0 表示不限制）")
     ap.add_argument("--seed", type=int, default=42)
 
     # 训练设置（快速 sanity check）
@@ -409,6 +430,13 @@ def main() -> None:
     # 1) load corpus
     corpus_path = Path(args.corpus_file)
     lines = _read_lines(corpus_path, args.max_lines)
+    # Optional held-out eval corpus (recommended for comparing model quality)
+    if str(args.eval_corpus_file).strip():
+        eval_path = Path(str(args.eval_corpus_file).strip())
+        eval_lines = _read_lines(eval_path, int(args.eval_max_lines))
+    else:
+        eval_path = None
+        eval_lines = lines
 
     # 2) load tokenizer (remote code)
     tok = AutoTokenizer.from_pretrained(args.tokenizer_dir, trust_remote_code=True)
@@ -471,6 +499,8 @@ def main() -> None:
         print("== setup ==")
         print(f"tokenizer_dir = {args.tokenizer_dir}")
         print(f"corpus_file   = {args.corpus_file} (lines={len(lines)})")
+        if eval_path is not None:
+            print(f"eval_corpus   = {str(eval_path)} (lines={len(eval_lines)})")
         print(f"vocab_size    = {tok.vocab_size}")
         print(f"pad/bos/eos   = {tok.pad_token_id}/{tok.bos_token_id}/{tok.eos_token_id}")
         print(f"model         = LlamaForCausalLM (params={num_params})")
@@ -609,7 +639,7 @@ def main() -> None:
                     ev_loss, ev_bpc = _eval_model(
                         model=eval_model,
                         tok=tok,
-                        lines=lines,
+                        lines=eval_lines,
                         device=dev,
                         seq_len=int(args.seq_len),
                         batch_size=int(eval_bs),

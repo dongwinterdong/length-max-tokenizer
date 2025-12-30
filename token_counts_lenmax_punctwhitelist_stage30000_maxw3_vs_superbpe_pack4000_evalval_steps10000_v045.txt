@@ -1,0 +1,56 @@
+[Length-MAX] vocab_size=32000
+[Length-MAX] longest_tokens(top 20):
+  #01 len= 31 id= 7020 tok='RecordingĠIndustryĠAssocia...
+  #02 len= 31 id= 9089 tok='WorldĠHeavyweightĠChampion...
+  #03 len= 23 id=22084 tok='receivedĠmixedĠreviewsĠ'
+  #04 len= 22 id= 2579 tok='CreditsĠandĠpersonnelĠ'
+  #05 len= 22 id= 5408 tok='MajorĠLeagueĠBaseballĠ'
+  #06 len= 22 id= 8164 tok='TagĠTeamĠChampionshipĠ'
+  #07 len= 22 id=21307 tok='positiveĠreviewsĠfromĠ'
+  #08 len= 21 id= 1106 tok='AndrianampoinimerinaĠ'
+  #09 len= 21 id= 3193 tok='EntertainmentĠWeeklyĠ'
+  #10 len= 21 id= 7054 tok='RegisterĠofĠHistoricĠ'
+  #11 len= 20 id= 3722 tok='GeschwaderkommodoreĠ'
+  #12 len= 20 id=10478 tok='associatedĠwithĠtheĠ'
+  #13 len= 20 id=12633 tok='constructionĠofĠtheĠ'
+  #14 len= 20 id=20766 tok='participatedĠinĠtheĠ'
+  #15 len= 20 id=22519 tok='responsibleĠforĠtheĠ'
+  #16 len= 20 id=25511 tok='tropicalĠdepressionĠ'
+  #17 len= 19 id= 1105 tok='AndriamasinavalonaĠ'
+  #18 len= 19 id= 2596 tok='CriticalĠreceptionĠ'
+  #19 len= 19 id= 7544 tok='SecretaryĠofĠStateĠ'
+  #20 len= 19 id= 8303 tok='TheĠfollowingĠyearĠ'
+
+[BPE] vocab_size=32000
+[BPE] longest_tokens(top 20):
+  #01 len= 53 id=30908 tok='byĠtheĠRecordingĠIndustryĠ...
+  #02 len= 41 id=20607 tok='byĠtheĠRecordingĠIndustryĠ...
+  #03 len= 34 id=23001 tok='NationalĠRegisterĠofĠHisto...
+  #04 len= 34 id=18002 tok='RecordingĠIndustryĠAssocia...
+  #05 len= 31 id=30092 tok='=Ġ=Ġ=ĠCriticalĠreceptionĠ=...
+  #06 len= 31 id=22890 tok='=Ġ=ĠMeteorologicalĠhistory...
+  #07 len= 31 id=24258 tok='WorldĠHeavyweightĠChampion...
+  #08 len= 30 id=29151 tok='=Ġ=Ġ=ĠCriticalĠresponseĠ=Ġ...
+  #09 len= 30 id=21973 tok='=Ġ=ĠCreditsĠandĠpersonnelĠ...
+  #10 len= 29 id=25191 tok='DepartmentĠofĠTransportati...
+  #11 len= 28 id=28453 tok='=Ġ=ĠCulturalĠreferencesĠ=Ġ=Ċ'
+  #12 len= 28 id=22033 tok='=Ġ=ĠMajorĠintersectionsĠ=Ġ=Ċ'
+  #13 len= 28 id=24942 tok='receivedĠmixedĠreviewsĠfromĠ'
+  #14 len= 27 id=18372 tok='=Ġ=ĠCriticalĠreceptionĠ=Ġ=Ċ'
+  #15 len= 27 id=29239 tok='intoĠaĠtropicalĠdepressionĠ'
+  #16 len= 26 id=29255 tok='=Ġ=ĠChartĠperformanceĠ=Ġ=Ċ'
+  #17 len= 26 id=21958 tok='=Ġ=ĠCreditsĠandĠpersonnelĠ'
+  #18 len= 26 id=29940 tok='=Ġ=ĠLiveĠperformancesĠ=Ġ=Ċ'
+  #19 len= 26 id=17992 tok='=Ġ=ĠRouteĠdescriptionĠ=Ġ=Ċ'
+  #20 len= 26 id=29626 tok='NationalĠHurricaneĠCenterĠ'
+
+[load] loading tokenizers ...
+[load] done in 0.22s  len_rust_active=True
+
+
+[done]
+lines        = 1165029
+chars        = 534799177
+len_tokens   = 102583421  tpc=0.191817  chars/token=5.213
+bpe_tokens   = 92226825  tpc=0.172451  chars/token=5.799
+elapsed      = 69.4s

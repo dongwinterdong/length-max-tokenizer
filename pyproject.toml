@@ -4,9 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "length-tokenizer-rs"
-version = "0.1.9"
+version = "0.1.10"
 description = "LengthTokenizer Rust (DP 最少 token / 最低 TPC) Python extension"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.8"
 classifiers = [
   "Programming Language :: Python :: 3",

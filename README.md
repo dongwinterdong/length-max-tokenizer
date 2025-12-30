@@ -22,12 +22,12 @@ pip install pyarrow
 - **Option A (recommended)**: publish via GitHub Actions (this repo) and install from PyPI.
   - In GitHub repo settings → **Secrets and variables** → **Actions**, add:
     - `PYPI_API_TOKEN`: your PyPI token (project-scoped recommended).
-  - Bump version in `pyproject.toml` / `Cargo.toml`, then create and push a tag like `v0.1.9`.
+  - Bump version in `pyproject.toml` / `Cargo.toml`, then create and push a tag like `v0.1.10`.
   - The workflow `/.github/workflows/publish_pypi.yml` will build wheels (Linux/macOS/Windows) + sdist and publish.
   - Then in any CI (or locally):
 
 ```bash
-pip install length-tokenizer-rs==0.1.9
+pip install length-tokenizer-rs==0.1.10
 ```
 
 - **Option B**: build-from-source install inside GitHub Actions (no PyPI needed).

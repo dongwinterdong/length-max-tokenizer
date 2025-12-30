@@ -1,7 +1,8 @@
 [package]
 name = "length_tokenizer"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
+license = "MIT"
 
 [lib]
 # 生成 Python 扩展需要 cdylib；同时保留 rlib 供本项目的二进制/测试使用
