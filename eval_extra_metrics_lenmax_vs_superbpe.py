@@ -62,6 +62,7 @@ def eval_batches(
     force_eos: bool,
     seed: int,
     precision: str,
+    warmup_batches: int,
 ) -> dict:
     if batches <= 0 or batch_size <= 0:
         raise ValueError("batches and batch_size must be > 0")
@@ -79,6 +80,37 @@ def eval_batches(
     total_tokens_for_loss = 0  # approximate: active - batch (causal shift)
     total_active_tokens = 0  # includes first token; excludes pad
     total_unk = 0
+
+    # Time breakdown.
+    # - elapsed (below) is end-to-end for this eval loop (pack + tokenize + decode-count + forward).
+    # - forward_elapsed measures ONLY the model forward time (no tokenization / decode).
+    forward_elapsed = 0.0
+
+    # Warmup: avoid first-call kernel selection / graph setup skewing the first evaluated model.
+    # We warm up the *exact* forward path (including loss) but do not count it in metrics.
+    warmup = max(0, int(warmup_batches))
+    if warmup > 0:
+        bs = int(batch_size)
+        sl = int(seq_len)
+        vocab_sz = int(getattr(getattr(model, "config", None), "vocab_size", 32000))
+        vocab_sz = max(4, vocab_sz)
+
+        # Use deterministic dummy inputs (no pad) to exercise the full compute graph.
+        g = torch.Generator(device=device)
+        g.manual_seed(int(seed) + 999)
+        dummy_ids = torch.randint(low=0, high=vocab_sz, size=(bs, sl), generator=g, device=device, dtype=torch.long)
+        dummy_mask = torch.ones((bs, sl), device=device, dtype=torch.long)
+        dummy_labels = dummy_ids.clone()
+        dummy_labels[dummy_labels == pad_id] = -100
+
+        for _ in range(warmup):
+            if dtype is None:
+                _ = model(input_ids=dummy_ids, attention_mask=dummy_mask, labels=dummy_labels)
+            else:
+                with torch.amp.autocast(device_type=device.type, dtype=dtype):
+                    _ = model(input_ids=dummy_ids, attention_mask=dummy_mask, labels=dummy_labels)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     model.eval()
@@ -113,11 +145,27 @@ def eval_batches(
         labels = input_ids.clone()
         labels[labels == pad_id] = -100
 
-        if dtype is None:
-            out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-        else:
-            with torch.amp.autocast(device_type=device.type, dtype=dtype):
+        # Measure model-only forward time.
+        if device.type == "cuda":
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            if dtype is None:
                 out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            else:
+                with torch.amp.autocast(device_type=device.type, dtype=dtype):
+                    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            end.record()
+            end.synchronize()
+            forward_elapsed += float(start.elapsed_time(end)) / 1000.0
+        else:
+            t_fwd0 = time.perf_counter()
+            if dtype is None:
+                out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            else:
+                with torch.amp.autocast(device_type=device.type, dtype=dtype):
+                    out = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            forward_elapsed += max(0.0, time.perf_counter() - t_fwd0)
         total_loss += float(out.loss.item())
 
     elapsed = max(1e-9, time.perf_counter() - t0)
@@ -135,6 +183,8 @@ def eval_batches(
 
     unk_rate = (float(total_unk) / float(total_active_tokens)) if (unk_id is not None and total_active_tokens > 0) else float("nan")
 
+    forward_elapsed = max(1e-9, float(forward_elapsed))
+
     return {
         "mean_loss": mean_loss,
         "ppl_token": ppl_token,
@@ -146,6 +196,10 @@ def eval_batches(
         "tok_per_s": float(total_tokens_for_loss) / elapsed,
         "char_per_s": float(total_chars) / elapsed,
         "bytes_per_s": float(total_bytes) / elapsed,
+        "model_tok_per_s": float(total_tokens_for_loss) / forward_elapsed,
+        "model_char_per_s": float(total_chars) / forward_elapsed,
+        "model_bytes_per_s": float(total_bytes) / forward_elapsed,
+        "model_forward_s": float(forward_elapsed),
         "batches": int(batches),
         "batch_size": int(batch_size),
         "seq_len": int(seq_len),
@@ -167,6 +221,7 @@ def main() -> None:
     ap.add_argument("--force_eos", action="store_true")
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--batches", type=int, default=64)
+    ap.add_argument("--warmup_batches", type=int, default=8, help="warmup forward passes (not counted), to remove first-call skew")
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--max_lines", type=int, default=0, help="0 = read all lines")
 
@@ -217,6 +272,7 @@ def main() -> None:
                 force_eos=bool(args.force_eos),
                 seed=int(args.seed),
                 precision=str(args.precision),
+                warmup_batches=int(args.warmup_batches),
             )
             results.append((corpus_name, m.name, r))
 
@@ -230,6 +286,8 @@ def main() -> None:
         ("unk", "unk_rate", "{:.2e}"),
         ("tok/s", "tok_per_s", "{:.0f}"),
         ("char/s", "char_per_s", "{:.0f}"),
+        ("model_tok/s", "model_tok_per_s", "{:.0f}"),
+        ("model_char/s", "model_char_per_s", "{:.0f}"),
     ]
 
     print(f"device={dev} precision={args.precision} seq_len={args.seq_len} pack_chars={args.pack_chars} pack_mode={args.pack_mode} force_eos={bool(args.force_eos)} batches={args.batches} batch_size={args.batch_size}")

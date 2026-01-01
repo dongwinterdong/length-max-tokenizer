@@ -4,6 +4,8 @@
 > - Rust 训练/统计实现（`length_tokenizer`）
 > - Rust 推理分词（DP 最少 token / 最低 TPC）：Python 扩展 `length_tokenizer_rs.DpTokenizer`
 > - HuggingFace remote code 导出（`train_to_hf*` 生成 `tokenizer_out/` 目录）
+>
+> **操作说明 / 复现实验入口**：见 `OPERATIONS.md`（v047/v048 pipeline、下游评测、画图、PyPI 发版等）。
 
 #### 1) Install
 
@@ -308,15 +310,15 @@ torchrun --standalone --nproc_per_node 2 validate_modern_arch_llama.py \
 这个仓库原本就带了 GitHub Actions 发版流程：`tokenizers_rust/.github/workflows/publish_pypi.yml`。
 
 - **GitHub 发版（推荐，跨平台 wheel）**：
-  - workflow 触发条件是 **push tag**，例如 `v0.1.7`
+  - workflow 触发条件是 **push tag**，例如 `v0.1.10`
   - 会构建 **Linux/macOS/Windows** 的 wheels（py3.10/3.11/3.12），并用 `PYPI_API_TOKEN` 发布到 PyPI
 
 示例（在你自己的 git repo 里执行）：
 
 ```bash
 git add tokenizers_rust
-git commit -m "Release v0.1.7"
-git tag v0.1.7
+git commit -m "Release v0.1.10"
+git tag v0.1.10
 git push origin main --tags
 ```
 
